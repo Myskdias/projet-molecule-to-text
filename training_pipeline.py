@@ -196,7 +196,7 @@ def main():
     if not os.path.exists(TRAIN_GRAPHS):
         print("Erreur: Données introuvables.")
         return
-
+    print(f"Device: {DEVICE}")
     # 1. Chargement Données & Vocab
     print("Chargement des données...")
     train_emb = load_id2emb(TRAIN_EMB_CSV)
