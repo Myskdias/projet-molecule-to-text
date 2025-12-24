@@ -2,35 +2,84 @@
 training_pipeline.py
 ====================
 
-Ce script orchestre l'entraînement multi-étapes, comme discuté :
+FICHIER LE PLUS IMPORTANT APRÈS architecture.py
+------------------------------------------------
 
-Etape 1 (prétraining retrieval):
--------------------------------
-- Apprendre un espace latent commun graph/text via loss contrastive CLIP-like.
-- But: retrieval performant (baseline Kaggle améliorée)
-- On gèle l'encodeur texte (T5 encoder) pour stabilité + VRAM.
+Ce fichier orchestre *toute la logique d'entraînement* du modèle hybride
+pour le challenge ALTEGRAD "Molecular Graph Captioning".
 
-Etape 2 (SFT génération / rewrite):
-----------------------------------
-- On construit un retriever (index text embeddings).
-- Pour chaque graphe:
-    retrieve caption candidate (top-k)
-    input = FIXED_PROMPT + retrieved_caption
-    conditionnement graphe = soft prompt (MLP(graph_emb) -> k tokens)
-    générateur = T5-base + LoRA
-- Loss: cross-entropy (teacher forcing) = stable.
+Il implémente un entraînement en PLUSIEURS ÉTAPES, volontairement séparées,
+afin de :
+- stabiliser l’apprentissage
+- faciliter le debugging
+- rendre chaque choix justifiable scientifiquement
 
-Etape 3 (optionnel):
--------------------
-- Fine-tuning metric-aware (MRT / BLEU-aware / BERTScore-aware)
-- Très coûteux et instable => à faire en dernier, éventuellement sur subset.
+⚠️ Ce fichier est VOLONTAIREMENT SUR-ANNOTÉ.
+Il sert de :
+- support pédagogique
+- trace des choix de design
+- squelette direct pour le rapport
 
-Important (engineering):
-------------------------
-Si on dégèle l'encodeur graphe après avoir construit l'index retrieval,
-l'espace commun change => index incohérent.
-=> soit on garde graph encoder gelé à l'étape 2,
-=> soit on reconstruit l'index périodiquement (plus coûteux).
+-----------------------------------------------------------------------
+PIPELINE D'ENTRAÎNEMENT (vue conceptuelle)
+-----------------------------------------------------------------------
+
+STAGE 0 (implicite) :
+    Prétraitement des graphes (fourni)
+
+STAGE 1 :
+    Graph–Text Alignment (Contrastive Learning, CLIP-style)
+        - encodeur graphe (MPNN)
+        - encodeur texte (T5 encoder, gelé)
+        - objectif : espace latent commun
+        - sortie : modèle de retrieval robuste
+
+STAGE 2 :
+    Retrieval-Augmented Generation (Rewrite)
+        - retrieval top-k captions
+        - soft prompt (graphe → tokens continus)
+        - T5-base + LoRA
+        - objectif : cross-entropy (teacher forcing)
+
+STAGE 3 (OPTIONNEL, avancé) :
+    Metric-aware fine-tuning
+        - BLEU / MRT / BERTScore
+        - uniquement en fin de projet
+
+-----------------------------------------------------------------------
+LIENS EXPLICITES AVEC LE COURS ALTEGRAD / MVA
+-----------------------------------------------------------------------
+
+- Contrastive Learning : InfoNCE, CLIP
+- Graph Representation Learning : MPNN
+- Retrieval-Augmented Generation (RAG)
+- Large Language Models : SFT, PEFT (LoRA)
+- Evaluation Metrics : BLEU, BERTScore
+
+-----------------------------------------------------------------------
+PHILOSOPHIE DE DESIGN
+-----------------------------------------------------------------------
+
+1) Séparer les étapes = réduire l’instabilité
+2) Geler tôt, dégeler tard
+3) Retrieval comme "prior lexical"
+4) Génération = correction, pas création from scratch
+"""
+"""
+ANTI-CHOIX GÉNÉRAUX :
+--------------------
+
+❌ Nous n'entraînons PAS tout le modèle de bout en bout dès le début.
+   → gradients instables
+   → retrieval qui dérive
+   → génération incohérente
+
+❌ Nous n'utilisons PAS une seule loss globale.
+   → objectifs incompatibles (retrieval vs génération)
+
+❌ Nous n'optimisons PAS directement la métrique Kaggle dès le départ.
+   → BLEU / BERTScore non différentiables
+   → fort risque d'effondrement
 """
 
 from __future__ import annotations
@@ -46,110 +95,214 @@ from tqdm import tqdm
 
 from transformers import T5TokenizerFast
 
+# Modules du projet
 from data_utils import PreprocessedGraphTextDataset, collate_graph_text
-from architecture import MPNNEncoder, FrozenT5TextEncoder, GraphTextCLIP, GraphSoftPromptT5
+from architecture import (
+    MPNNEncoder,
+    FrozenT5TextEncoder,
+    GraphTextCLIP,
+    GraphSoftPromptT5,
+)
 from retrieval import RetrievalIndex
 
-
-# =========================
-# Reproductibilité (utile en MVA)
-# =========================
 def set_seed(seed: int = 42):
+    """
+    Fixe toutes les sources de hasard pertinentes.
+
+    POURQUOI C'EST IMPORTANT :
+    --------------------------
+    - Le retrieval est sensible aux poids initiaux
+    - Les LLM ont une variance non négligeable
+    - En MVA, la reproductibilité est un critère implicite
+    """
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-# =========================
-# Config
-# =========================
 @dataclass
 class Config:
+    """
+    Conteneur centralisé pour tous les hyperparamètres.
+
+    POURQUOI une dataclass ?
+    ------------------------
+    - lisibilité
+    - traçabilité
+    - modification simple pour ablations
+
+    ANTI-CHOIX :
+    ------------
+    ❌ Nous n'utilisons PAS argparse ici.
+       → bruit inutile à ce stade
+       → les expériences sont encore exploratoires
+    """
+
+    # --------------------
+    # Hardware / device
+    # --------------------
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # data
+    # --------------------
+    # Data
+    # --------------------
     train_graphs: str = "data/train_graphs.pkl"
-    val_graphs: str = "data/validation_graphs.pkl"  # optionnel
-    use_val: bool = False
+    val_graphs: str = "data/validation_graphs.pkl"
+    use_val: bool = False  # activable plus tard
 
-    # save
+    # --------------------
+    # Checkpoints
+    # --------------------
     stage1_path: str = "weights_stage1_clip.pt"
     stage2_path: str = "weights_stage2_t5.pt"
 
-    # model dims
+    # --------------------
+    # Graph encoder
+    # --------------------
     node_vocab_sizes: list = None
     edge_vocab_sizes: list = None
     hidden_graph: int = 300
     shared_dim: int = 256
 
-    # T5
+    # --------------------
+    # LLM / T5
+    # --------------------
     t5_name: str = "t5-base"
     prompt_len: int = 8
 
-    # tokenization
+    # --------------------
+    # Tokenisation
+    # --------------------
     max_in_len: int = 256
     max_out_len: int = 256
 
-    # retrieval
+    # --------------------
+    # Retrieval
+    # --------------------
     topk: int = 5
 
-    # training stage1
+    # --------------------
+    # Stage 1 (contrastive)
+    # --------------------
     stage1_epochs: int = 3
     stage1_lr: float = 2e-4
 
-    # training stage2
+    # --------------------
+    # Stage 2 (generation)
+    # --------------------
     stage2_epochs: int = 3
     stage2_lr: float = 5e-5
     freeze_warmup_epochs: int = 1
 
-    # loader
+    # --------------------
+    # DataLoader
+    # --------------------
     batch_size: int = 16
     num_workers: int = 0
 
+"""
+ANTI-CHOIX :
+------------
+❌ Nous n'utilisons PAS un prompt très long ou verbeux.
+   → bruit inutile
+   → le soft prompt porte l'information structurée
 
-CFG = Config(
-    node_vocab_sizes=[200, 20],   # <-- à remplacer par vos vrais vocabs si besoin
-    edge_vocab_sizes=[50, 20],    # idem
-)
+❌ Nous n'utilisons PAS un prompt dépendant du graphe en texte.
+   → redondant avec le soft prompt
+   → risque d'hallucinations
+"""
 
 FIXED_PROMPT = (
-    "Rephrase the following molecular description so that it accurately reflects "
-    "the structure and roles of the given molecule.\n"
+    "Rephrase the following molecular description so that it accurately "
+    "reflects the structure and roles of the given molecule.\n"
     "Description:\n"
 )
 
-
-# =========================
-# Helpers gel/dégel
-# =========================
 def set_requires_grad(module: torch.nn.Module, value: bool):
+    """
+    Active ou désactive le calcul de gradients sur un module.
+
+    UTILISATION :
+    -------------
+    - Stage 1 : on gèle l'encodeur texte
+    - Stage 2 : on gèle le retrieval au début
+    - Stage 3 : dégel progressif (optionnel)
+    """
     for p in module.parameters():
         p.requires_grad = value
 
 
 # ============================================================
-# Stage 1: Graph–Text Alignment (CLIP-like contrastive learning)
+# STAGE 1 : GRAPH–TEXT ALIGNMENT (CLIP-STYLE)
 # ============================================================
+
 def train_stage1_clip(train_dl, cfg: Config):
     """
-    On apprend :
-    - MPNN graph encoder
-    - projections (graph_proj, text_proj)
-    pour aligner graphe et texte.
+    STAGE 1 : apprendre un espace latent commun graphe–texte.
 
-    Encodeur texte:
-    --------------
-    T5 encoder gelé (FrozenT5TextEncoder). Pourquoi ?
-    - VRAM/compute
-    - dataset ~32k : on évite d'overfit un gros encodeur
-    - on garde un "anchor" sémantique stable
+    OBJECTIF
+    --------
+    Nous voulons que :
+        sim(graph_i, text_i) >> sim(graph_i, text_j)
+
+    Cela correspond au paradigme CLIP (image-text), adapté ici au couple :
+        (molecular graph, caption).
+
+    POURQUOI FAIRE CE STAGE AVANT LA GÉNÉRATION ?
+    --------------------------------------------
+    - C'est stable : loss contrastive simple, dense, bien conditionnée.
+    - Cela donne un retrieval déjà performant (baseline Kaggle++),
+      même sans LLM.
+    - Cela fournit ensuite un prior lexical de haute qualité au générateur
+      (essentiel pour BLEU).
+
+    LIEN COURS
+    ----------
+    - Contrastive learning / InfoNCE
+    - CLIP : température apprenable + loss symétrique
+
+    PARAMÈTRES ENTRAÎNÉS
+    --------------------
+    On entraîne :
+        - l’encodeur graphe (MPNN)
+        - les projections (graph_proj, text_proj)
+    On gèle :
+        - l’encodeur texte (T5 encoder) par design
+
+    Pourquoi geler l’encodeur texte ?
+    ---------------------------------
+    - Réduit la variance : le texte sert d’ancre sémantique stable
+    - Empêche l’espace latent de dériver dans deux directions en même temps
+    - VRAM / temps : fine-tuner un encodeur complet est coûteux et souvent inutile
+
+    Returns
+    -------
+    clip : GraphTextCLIP entraîné sur l’alignement
+    tokenizer : tokenizer T5 (utilisé partout ensuite)
     """
+
     print("\n" + "=" * 70)
     print("STAGE 1: CLIP-like graph-text alignment (retrieval pretraining)")
     print("=" * 70)
 
+    # --------------------------------------------------------
+    # Tokenizer : on prend celui de T5 pour cohérence
+    # --------------------------------------------------------
     tokenizer = T5TokenizerFast.from_pretrained(cfg.t5_name)
 
+    # --------------------------------------------------------
+    # Construction du modèle Stage 1
+    # --------------------------------------------------------
+    """
+    On instancie :
+    - MPNNEncoder : encodeur graphe
+    - FrozenT5TextEncoder : encodeur texte gelé
+    - GraphTextCLIP : projections + logit_scale + normalisation
+
+    Note :
+    ------
+    text_dim=768 car t5-base a d_model=768.
+    (Attention : t5-small = 512, t5-large = 1024, etc.)
+    """
     graph_enc = MPNNEncoder(
         node_vocab_sizes=cfg.node_vocab_sizes,
         edge_vocab_sizes=cfg.edge_vocab_sizes,
@@ -164,22 +317,67 @@ def train_stage1_clip(train_dl, cfg: Config):
         graph_encoder=graph_enc,
         text_encoder=text_enc,
         graph_dim=cfg.hidden_graph,
-        text_dim=768,  # t5-base d_model
+        text_dim=768,
         shared_dim=cfg.shared_dim,
     ).to(cfg.device)
 
-    # On optimise seulement graph encoder + proj (text encoder freeze)
-    params = list(clip.graph_encoder.parameters()) + list(clip.graph_proj.parameters()) + list(clip.text_proj.parameters())
+    # --------------------------------------------------------
+    # Optimisation : on entraîne seulement certaines parties
+    # --------------------------------------------------------
+    """
+    PARAMS ENTRAÎNÉS :
+    - graph_encoder : apprend la structure moléculaire
+    - graph_proj / text_proj : alignement dans l'espace shared
+
+    PARAMS GELÉS :
+    - text_encoder : frozen (p.requires_grad=False)
+
+    Pourquoi entraîner text_proj si text_encoder est gelé ?
+    -------------------------------------------------------
+    - text_proj sert d'adaptation légère au domaine (captions chimie)
+    - on ne modifie pas l'encodeur lourd, mais on permet une calibration
+    """
+    """
+    ANTI-CHOIX STAGE 1 :
+    -------------------
+
+    ❌ Nous n'entraînons PAS le générateur (T5) en même temps que le retrieval.
+    → couplage très instable
+    → retrieval devient une cible mouvante ("moving target")
+
+    ❌ Nous ne fine-tunons PAS l'encodeur texte complet.
+    → coûteux
+    → risque d'overfitting
+    → pas nécessaire pour un retrieval performant
+
+    ❌ Nous n'utilisons PAS de loss triplet ou margin ranking à la place.
+    → InfoNCE/CLIP est plus dense (tous les négatifs du batch)
+    → converge plus vite et plus stable
+
+    ❌ Nous n'utilisons PAS d'augmentation de graphes ici.
+    → potentiellement utile, mais ajoute de la variance
+    → à introduire seulement une fois le pipeline stable
+    """
+    params = (
+        list(clip.graph_encoder.parameters())
+        + list(clip.graph_proj.parameters())
+        + list(clip.text_proj.parameters())
+    )
     opt = torch.optim.AdamW(params, lr=cfg.stage1_lr)
 
+    # --------------------------------------------------------
+    # Boucle d'entraînement
+    # --------------------------------------------------------
     clip.train()
+
     for ep in range(cfg.stage1_epochs):
-        total = 0.0
+        total_loss = 0.0
         pbar = tqdm(train_dl, desc=f"[Stage1] epoch {ep+1}/{cfg.stage1_epochs}")
 
         for batch_graph, descs, _idxs in pbar:
             batch_graph = batch_graph.to(cfg.device)
 
+            # Tokenisation batch de descriptions (texte brut → input_ids)
             tok = tokenizer(
                 descs,
                 padding=True,
@@ -188,25 +386,65 @@ def train_stage1_clip(train_dl, cfg: Config):
                 return_tensors="pt",
             ).to(cfg.device)
 
-            g, t = clip(batch_graph, tok["input_ids"], tok["attention_mask"])   # [B,D], [B,D]
+            # Encodage dans l'espace latent
+            g = clip.encode_graph(batch_graph)                         # [B, D]
+            t = clip.encode_text(tok["input_ids"], tok["attention_mask"])  # [B, D]
 
-            # CLIP logits = scale * dot
+            # --------------------------------------------------------
+            # Loss contrastive type CLIP (symétrique)
+            # --------------------------------------------------------
+            """
+            Logits:
+                logits_ij = s * <g_i, t_j>
+            avec g_i, t_j normalisés => dot product = cosine similarity
+
+            s = exp(logit_scale) = 1/temperature
+            → la température est apprenable comme dans CLIP
+
+            Labels:
+                labels = [0, 1, 2, ..., B-1]
+            signifiant : g_i doit matcher t_i
+
+            Loss symétrique:
+                CE(logits, labels) + CE(logits.T, labels)
+            => encourage alignement dans les deux sens.
+            """
             logit_scale = clip.logit_scale.exp()
-            logits = logit_scale * (g @ t.t())  # [B,B]
+            logits = logit_scale * (g @ t.t())        # [B, B]
             labels = torch.arange(g.size(0), device=cfg.device)
 
-            # Loss contrastive symétrique (graph->text et text->graph)
-            loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)) / 2
+            loss_g2t = F.cross_entropy(logits, labels)
+            loss_t2g = F.cross_entropy(logits.t(), labels)
+            loss = 0.5 * (loss_g2t + loss_t2g)
 
+            # Optimisation standard
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
-            total += loss.item()
+            total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        print(f"[Stage1] epoch {ep+1} avg loss: {total/len(train_dl):.4f}")
+        print(f"[Stage1] epoch {ep+1} avg loss: {total_loss/len(train_dl):.4f}")
 
+    # --------------------------------------------------------
+    # Sauvegarde des poids Stage 1
+    # --------------------------------------------------------
+    """
+    Pourquoi sauvegarder séparément ?
+    ---------------------------------
+    - Stage 2 dépend de Stage 1
+    - possibilité de faire ablations :
+        * retrieval-only
+        * retrieval + generator
+    - reproductibilité : on fige un point de référence
+
+    On sauvegarde uniquement :
+    - graph_encoder
+    - graph_proj
+    - text_proj
+    (text_encoder est gelé, donc pas nécessaire)
+    """
     torch.save(
         {
             "graph_encoder": clip.graph_encoder.state_dict(),
@@ -220,95 +458,183 @@ def train_stage1_clip(train_dl, cfg: Config):
     return clip, tokenizer
 
 
-# ============================================================
-# Stage 2: Retrieval-Augmented Generation (SoftPrompt + T5 + LoRA)
-# ============================================================
-def train_stage2_t5(train_dl, clip, tokenizer, cfg: Config):
+def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
     """
-    Objectif:
-    ---------
-    Apprendre un modèle génératif qui corrige/réécrit une caption récupérée.
+    STAGE 2 : Retrieval-Augmented Generation (Rewrite).
 
-    Pourquoi "rewrite" plutôt que génération from scratch ?
-    -------------------------------------------------------
-    - le dataset a un style très template + long
-    - BLEU est sensible aux paraphrases
-    - retrieval fournit un "prior" lexical et structurel robuste
-    - le LLM apprend à faire des corrections locales + alignement au graphe
+    OBJECTIF
+    --------
+    Pour chaque graphe :
+        1) encoder le graphe
+        2) récupérer une ou plusieurs captions proches (retrieval)
+        3) conditionner T5 via :
+            - un prompt fixe (instruction)
+            - un soft prompt (embedding du graphe)
+            - la caption récupérée
+        4) apprendre à produire la description GT
+
+    Cette étape est RESPONSABLE de :
+    - la qualité finale Kaggle
+    - l'équilibre BLEU / BERTScore
+
+    CONTRAINTES CLÉS
+    ----------------
+    - le retrieval doit être STABLE
+    - le graphe ne doit PAS "fuir" vers la sortie
+    - le LLM doit corriger, pas halluciner
+
+    ANTI-CHOIX STAGE 2 :
+    -------------------
+
+    ❌ Nous n'entraînons PAS le retrieval end-to-end dès le départ.
+    → sinon le retrieval s'adapte au bruit du générateur
+
+    ❌ Nous ne backpropagons PAS à travers le retrieval.
+    → conceptuellement faux (mémoire externe)
+    → instable
+
+    ❌ Nous n'utilisons PAS beam search pendant l'entraînement.
+    → teacher forcing suffit
+    → beam = uniquement inference
+
+    ❌ Nous n'utilisons PAS plusieurs captions concaténées.
+    → trop long
+    → bruit sémantique
+
     """
+
     print("\n" + "=" * 70)
-    print("STAGE 2: RAG rewrite (SoftPrompt + T5-base + LoRA)")
+    print("STAGE 2: Retrieval-Augmented Generation (rewrite)")
     print("=" * 70)
 
-    # 1) Construire l'index retrieval sur toutes les captions train
-    # NB: on reconstruit depuis le DataLoader (simple et sûr).
-    train_texts = []
-    for _bg, descs, _idx in train_dl:
-        train_texts.extend(descs)
+    device = cfg.device
 
-    retriever = RetrievalIndex(device=cfg.device)
-    retriever.build_text_index(clip, tokenizer, train_texts, batch_size=64, max_len=cfg.max_in_len)
+    # --------------------------------------------------------
+    # Construction de l'index de retrieval
+    # --------------------------------------------------------
+    """
+    On construit un index simple en mémoire :
+    - embeddings texte normalisés
+    - recherche top-k par similarité cosinus
 
-    # 2) Générateur T5 + LoRA + soft prompt
-    gen = GraphSoftPromptT5(
+    POURQUOI PAS FAISS ?
+    --------------------
+    - ~32k captions → torch.topk suffit
+    - simplicité > micro-optimisation
+    """
+    clip.eval()
+    retriever = RetrievalIndex(clip, tokenizer, device)
+
+    # --------------------------------------------------------
+    # Générateur : T5 + Soft Prompt + LoRA
+    # --------------------------------------------------------
+    generator = GraphSoftPromptT5(
         model_name=cfg.t5_name,
         graph_emb_dim=cfg.hidden_graph,
         prompt_len=cfg.prompt_len,
-        lora_r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=("q", "v"),
-    ).to(cfg.device)
+    ).to(device)
 
-    # 3) Gel initial (comme tu voulais)
-    # On gèle retrieval (clip) pour stabiliser la SFT.
+    # --------------------------------------------------------
+    # Chargement des poids Stage 1
+    # --------------------------------------------------------
+    """
+    Le générateur dépend de :
+    - graph_encoder entraîné en Stage 1
+    - espace latent de retrieval
+
+    IMPORTANT :
+    -----------
+    - On partage le graph_encoder entre clip et generator
+    - Cela garantit la cohérence retrieval ↔ génération
+    """
+    ckpt = torch.load(cfg.stage1_path, map_location=device)
+    clip.graph_encoder.load_state_dict(ckpt["graph_encoder"])
+    clip.graph_proj.load_state_dict(ckpt["graph_proj"])
+    clip.text_proj.load_state_dict(ckpt["text_proj"])
+
+    # --------------------------------------------------------
+    # Gel initial : stabilisation
+    # --------------------------------------------------------
+    """
+    STRATÉGIE DE GEL :
+    -----------------
+    Epochs 0 → freeze_warmup_epochs:
+        - graph_encoder : GELÉ
+        - retrieval     : GELÉ
+        - T5 (LoRA)     : entraîné
+
+    Motivation :
+    ------------
+    - le retrieval fournit un prior fixe
+    - le LLM apprend d'abord à exploiter ce prior
+    """
     set_requires_grad(clip.graph_encoder, False)
     set_requires_grad(clip.graph_proj, False)
-    set_requires_grad(clip.text_proj, False)
-    clip.eval()
+    set_requires_grad(generator, True)
 
-    # LoRA + softprompt sont trainables (PEFT)
-    trainable_params = [p for p in gen.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable_params, lr=cfg.stage2_lr)
+    opt = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, generator.parameters()),
+        lr=cfg.stage2_lr,
+    )
 
-    gen.train()
+    # --------------------------------------------------------
+    # Boucle d'entraînement
+    # --------------------------------------------------------
+    generator.train()
+
     for ep in range(cfg.stage2_epochs):
-        # Optionnel: dégel progressif
-        # Attention: si on dégel le graph encoder, l'index retrieval devient "stale".
-        # => solution rigoureuse = rebuild index régulièrement.
-        if ep >= cfg.freeze_warmup_epochs:
-            # Ici je te le laisse OFF par défaut (plus stable).
-            # Décommenter si vous voulez expérimenter:
-            # set_requires_grad(clip.graph_encoder, True)
-            # set_requires_grad(clip.graph_proj, True)
-            # retriever.build_text_index(clip, tokenizer, train_texts, batch_size=64, max_len=cfg.max_in_len)
-            pass
+        print(f"\n[Stage2] epoch {ep+1}/{cfg.stage2_epochs}")
 
-        total = 0.0
-        pbar = tqdm(train_dl, desc=f"[Stage2] epoch {ep+1}/{cfg.stage2_epochs}")
+        # ----------------------------------------------------
+        # Dégel progressif
+        # ----------------------------------------------------
+        if ep == cfg.freeze_warmup_epochs:
+            """
+            À partir de maintenant :
+            - on autorise une adaptation fine du graphe
+            - mais avec un LR indirectement plus faible
+            """
+            set_requires_grad(clip.graph_encoder, True)
+            set_requires_grad(clip.graph_proj, True)
 
-        for batch_graph, targets, idxs in pbar:
-            batch_graph = batch_graph.to(cfg.device)
+            opt = torch.optim.AdamW(
+                list(generator.parameters())
+                + list(clip.graph_encoder.parameters())
+                + list(clip.graph_proj.parameters()),
+                lr=cfg.stage2_lr * 0.5,
+            )
 
-            # --- Retrieval step (no grad)
+        pbar = tqdm(train_dl, desc=f"[Stage2] epoch {ep+1}")
+
+        for batch_graph, descs, idxs in pbar:
+            batch_graph = batch_graph.to(device)
+
+            # ------------------------------------------------
+            # Retrieval (sans gradient)
+            # ------------------------------------------------
+            """
+            IMPORTANT :
+            - retrieval = mémoire externe NON différentiable
+            - aucun gradient ne doit passer ici
+            """
             with torch.no_grad():
-                nn_idx, _scores = retriever.query(clip, batch_graph, k=cfg.topk)  # [B,k]
-                chosen = nn_idx[:, 0].clone()
+                retrieved_descs = retriever.retrieve(
+                    batch_graph,
+                    idxs=idxs,
+                    topk=cfg.topk,
+                )
 
-                # Heuristique anti self-retrieval :
-                # marche si l'ordre d'index == ordre dataset.
-                if cfg.topk > 1:
-                    for b in range(chosen.size(0)):
-                        if int(chosen[b].item()) == int(idxs[b].item()):
-                            chosen[b] = nn_idx[b, 1]
-
-                retrieved_texts = retriever.get_texts(chosen)
-
-                # Graph embedding pour softprompt (AVANT projection CLIP)
-                graph_emb, _ = clip.graph_encoder(batch_graph)  # [B, hidden_graph]
-
-            # --- Build T5 inputs
-            inputs = [FIXED_PROMPT + rt for rt in retrieved_texts]
+            # ------------------------------------------------
+            # Construction des entrées texte
+            # ------------------------------------------------
+            """
+            Input format :
+                FIXED_PROMPT + retrieved_description
+            """
+            inputs = [
+                FIXED_PROMPT + rd
+                for rd in retrieved_descs
+            ]
 
             tok_in = tokenizer(
                 inputs,
@@ -316,95 +642,101 @@ def train_stage2_t5(train_dl, clip, tokenizer, cfg: Config):
                 truncation=True,
                 max_length=cfg.max_in_len,
                 return_tensors="pt",
-            ).to(cfg.device)
+            ).to(device)
 
             tok_out = tokenizer(
-                targets,
+                descs,
                 padding=True,
                 truncation=True,
                 max_length=cfg.max_out_len,
                 return_tensors="pt",
-            ).to(cfg.device)
+            ).to(device)
 
-            labels = tok_out["input_ids"].clone()
-            labels[labels == tokenizer.pad_token_id] = -100
+            # ------------------------------------------------
+            # Encodage graphe → soft prompt
+            # ------------------------------------------------
+            graph_emb, _ = clip.graph_encoder(batch_graph)
 
-            out = gen(
+            # ------------------------------------------------
+            # Forward T5 (teacher forcing)
+            # ------------------------------------------------
+            out = generator(
                 graph_emb=graph_emb,
                 input_ids=tok_in["input_ids"],
                 attention_mask=tok_in["attention_mask"],
-                labels=labels,
+                labels=tok_out["input_ids"],
             )
+
             loss = out.loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             opt.step()
 
-            total += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        print(f"[Stage2] epoch {ep+1} avg loss: {total/len(train_dl):.4f}")
-
+    # --------------------------------------------------------
+    # Sauvegarde Stage 2
+    # --------------------------------------------------------
     torch.save(
         {
-            "clip_graph_encoder": clip.graph_encoder.state_dict(),
-            "clip_graph_proj": clip.graph_proj.state_dict(),
-            "clip_text_proj": clip.text_proj.state_dict(),
-            "t5_lora_softprompt": gen.state_dict(),
+            "generator": generator.state_dict(),
+            "graph_encoder": clip.graph_encoder.state_dict(),
+            "graph_proj": clip.graph_proj.state_dict(),
         },
         cfg.stage2_path,
     )
     print(f"[Stage2] Saved weights -> {cfg.stage2_path}")
 
-    return gen, retriever
+    return generator
 
-
-# ============================================================
-# Stage 3 (Optionnel): Metric-aware (MRT / BLEU/BERTScore)
-# ============================================================
-def train_stage3_metric_aware(*_args, **_kwargs):
+def train_stage3_metric_aware():
     """
-    Placeholder volontaire.
+    STAGE 3 (OPTIONNEL, AVANCÉ).
 
-    Pourquoi je le laisse en stub ?
-    ------------------------------
-    - MRT / BLEU-aware implique sampling/beam + reward sur texte généré
-    - BERTScore -> coûteux (RoBERTa-base) à calculer dans la boucle
-    - Risque fort de rendre l'entraînement instable si fait trop tôt
+    Idée :
+    ------
+    Optimiser directement :
+        - BLEU-4
+        - BERTScore
 
-    Recommandation MVA:
-    -------------------
-    - faire Stage1+Stage2 d'abord
-    - valider que la génération est "propre"
-    - ensuite faire un "polish" metric-aware sur un subset
+    Méthodes possibles :
+    --------------------
+    - Minimum Risk Training (MRT)
+    - REINFORCE
+
+    POURQUOI CE N'EST PAS FAIT ICI ?
+    --------------------------------
+    - Implémentation longue et délicate
+    - Facile à casser
+    - À tenter UNIQUEMENT quand le pipeline est stable
     """
-    raise NotImplementedError("Stage3 à implémenter proprement après validation Stage1+Stage2.")
-
+    raise NotImplementedError
 
 def main():
     set_seed(42)
+    cfg = Config()
 
-    assert os.path.exists(CFG.train_graphs), f"Missing {CFG.train_graphs}"
-
-    ds_train = PreprocessedGraphTextDataset(CFG.train_graphs)
-    dl_train = DataLoader(
-        ds_train,
-        batch_size=CFG.batch_size,
+    # --------------------------------------------------------
+    # Dataset & DataLoader
+    # --------------------------------------------------------
+    train_ds = PreprocessedGraphTextDataset(cfg.train_graphs)
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=CFG.num_workers,
         collate_fn=collate_graph_text,
+        num_workers=cfg.num_workers,
     )
 
-    # Stage1
-    clip, tokenizer = train_stage1_clip(dl_train, CFG)
+    # --------------------------------------------------------
+    # STAGE 1
+    # --------------------------------------------------------
+    clip, tokenizer = train_stage1_clip(train_dl, cfg)
 
-    # Stage2
-    _gen, _retriever = train_stage2_t5(dl_train, clip, tokenizer, CFG)
+    # --------------------------------------------------------
+    # STAGE 2
+    # --------------------------------------------------------
+    train_stage2_t5(train_dl, clip, tokenizer, cfg)
 
-    print("\nTraining completed.")
-
-
-if __name__ == "__main__":
-    main()
+    print("\nTraining completed successfully.")

@@ -2,88 +2,106 @@
 data_utils.py
 =============
 
-Objectif (challenge Kaggle ALTEGRAD - Molecular Graph Captioning)
----------------------------------------------------------------
-On veut apprendre un modèle qui, à partir d'un graphe moléculaire (PyG Data),
-produit une description en langage naturel.
+RÔLE DANS LE PROJET
+------------------
+Ce fichier définit l'interface entre :
+- les données brutes (graphes moléculaires PyTorch Geometric)
+- le pipeline d'entraînement PyTorch
 
-Pourquoi ce fichier est important ?
------------------------------------
-- Le dataset fourni est une liste de `torch_geometric.data.Data`.
-- Chaque objet contient :
-    data.x           : features catégorielles des atomes (9 colonnes d'entiers)
-    data.edge_index  : connectivité
-    data.edge_attr   : features catégorielles des liaisons (3 colonnes d'entiers)
-    data.id          : identifiant unique (obligatoire pour la soumission Kaggle)
-    data.description : caption GT (train/val) ; absent sur test
+Il est *critique* car toute erreur ici (ID, alignement texte/graphe,
+collate incorrect) conduit à :
+- erreurs Kaggle ("ID column not found")
+- fuites d'information (train -> retrieval)
+- bugs silencieux très coûteux à diagnostiquer
 
-Design choice:
---------------
-Nous revenons à une représentation *texte réelle* des descriptions.
-On NE traite PAS des embeddings CSV comme des "token ids" : c'était incohérent.
+CONTEXTE DATASET (Challenge ALTEGRAD)
+------------------------------------
+Chaque molécule est représentée par un objet torch_geometric.data.Data avec :
+- data.x           : [N, 9] features atomiques catégorielles
+- data.edge_index  : [2, E] connectivité
+- data.edge_attr   : [E, 3] features de liaisons catégorielles
+- data.id          : identifiant unique (clé Kaggle)
+- data.description : texte GT (absent pour test)
 
-On fournit donc :
-- un Dataset train/val qui renvoie (graph, description, idx)
-- un Dataset test qui renvoie (graph, id)
-- des collate_fn compatibles avec DataLoader PyTorch
+CHOIX DE DESIGN
+---------------
+- On travaille avec les *textes bruts* (string), PAS avec des embeddings CSV
+  → plus propre, plus flexible, et compatible avec T5/BERTScore.
+- On sépare explicitement train/val et test
+  → évite les erreurs de logique en inference.
 """
 
 from __future__ import annotations
 
 import pickle
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch
 
 
+# ============================================================
+# Dataset TRAIN / VAL
+# ============================================================
+
 class PreprocessedGraphTextDataset(Dataset):
     """
-    Dataset pour train/val : renvoie (graph, description, idx).
+    Dataset utilisé pour l'entraînement et la validation.
 
-    Pourquoi garder idx ?
-    --------------------
-    - Utile pour éviter le "self-retrieval leak" :
-      si on fait retrieval sur le train, il faut éviter de récupérer
-      exactement la description de l'exemple courant.
-    - Utile aussi pour logging/diagnostics.
+    Chaque item renvoyé est :
+        (graph, description, idx)
 
-    Note:
-    -----
-    Les graphes viennent des .pkl fournis. Chaque élément est un PyG Data.
+    POURQUOI inclure idx ?
+    ----------------------
+    - Indispensable pour le retrieval training :
+      on doit éviter de récupérer la description exacte de l'exemple courant.
+    - Permet aussi un debugging propre (correspondance index <-> graphe).
+
+    ANTI-CHOIX (important):
+    -----------------------
+    - On ne renvoie PAS directement des embeddings texte ici.
+      → l'encodage texte dépend du tokenizer et du modèle utilisé
+      → il doit rester dans le pipeline modèle, pas dans le dataset.
     """
 
     def __init__(self, graph_path: str):
-        self.graph_path = graph_path
         with open(graph_path, "rb") as f:
             self.graphs = pickle.load(f)
 
-        self.ids = [g.id for g in self.graphs]  # aligné avec l'ordre des graphes
+        self.ids = [g.id for g in self.graphs]
 
     def __len__(self) -> int:
         return len(self.graphs)
 
     def __getitem__(self, idx: int):
         g = self.graphs[idx]
+
+        # En train/val, description est toujours présente
         desc = getattr(g, "description", "")
         return g, desc, idx
 
 
+# ============================================================
+# Dataset TEST
+# ============================================================
+
 class PreprocessedGraphTestDataset(Dataset):
     """
-    Dataset pour test : renvoie (graph, id).
+    Dataset pour l'inférence Kaggle.
 
-    Pourquoi un dataset séparé ?
+    Chaque item renvoyé est :
+        (graph, id)
+
+    POURQUOI un dataset séparé ?
     ----------------------------
-    - Sur test, `description` est absent -> on veut éviter toute confusion.
-    - On prépare directement la soumission Kaggle avec (ID, description_pred).
+    - Sur le test set, la description GT n'existe pas.
+    - Cela évite toute ambiguïté ou bug de logique.
     """
 
     def __init__(self, graph_path: str):
         with open(graph_path, "rb") as f:
             self.graphs = pickle.load(f)
-        self.ids = [g.id for g in self.graphs]
 
     def __len__(self) -> int:
         return len(self.graphs)
@@ -93,15 +111,26 @@ class PreprocessedGraphTestDataset(Dataset):
         return g, g.id
 
 
+# ============================================================
+# Collate functions
+# ============================================================
+
 def collate_graph_text(batch: List[Tuple]):
     """
-    Collate function train/val.
+    Collate function pour train / val.
 
-    batch: List[(graph, desc, idx)]
-    returns:
-      batch_graph : PyG Batch
-      descs       : List[str]
-      idxs        : torch.LongTensor [B]
+    Entrée :
+        batch = [(graph, desc, idx), ...]
+
+    Sortie :
+        - batch_graph : PyG Batch (concaténation des graphes)
+        - descs       : List[str] (textes bruts)
+        - idxs        : Tensor [B] (indices dataset)
+
+    IMPORTANT :
+    -----------
+    - Les descriptions restent des strings.
+    - La tokenisation est faite PLUS TARD, avec le bon tokenizer.
     """
     graphs, descs, idxs = zip(*batch)
     batch_graph = Batch.from_data_list(list(graphs))
@@ -111,26 +140,15 @@ def collate_graph_text(batch: List[Tuple]):
 
 def collate_graph_only(batch):
     """
-    Collate function test.
+    Collate function pour test.
 
-    batch: List[(graph, id)]
-    returns:
-      batch_graph : PyG Batch (avec .id accessible)
-      ids         : List[str]
+    Entrée :
+        batch = [(graph, id), ...]
+
+    Sortie :
+        - batch_graph : PyG Batch
+        - ids         : List[str]
     """
     graphs, ids = zip(*batch)
     batch_graph = Batch.from_data_list(list(graphs))
     return batch_graph, list(ids)
-
-
-def load_descriptions_from_graphs(graph_path: str) -> Dict[str, str]:
-    """
-    Utilitaire (debug / baselines) : map id -> description.
-
-    Peut servir pour:
-    - sanity check du dataset
-    - baseline retrieval-only (sans LLM)
-    """
-    with open(graph_path, "rb") as f:
-        graphs = pickle.load(f)
-    return {g.id: getattr(g, "description", "") for g in graphs}
