@@ -1,220 +1,134 @@
 import os
 import csv
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from architecture import DeepGINEEncoder, TextEncoder, MolecularCaptionModel
-from retrieval import RetrievalIndex
-from data_utils import (
-    load_id2emb,
-    load_descriptions_from_graphs,
-    PreprocessedGraphDataset,
-    collate_fn,
-)
+from transformers import T5TokenizerFast
 
-# =========================
-# CONFIG (match training_pipeline.py)
-# =========================
+from architecture import (
+    MPNNEncoder,
+    FrozenT5TextEncoder,
+    GraphTextCLIP,
+    GraphSoftPromptT5,
+)
+from retrieval import RetrievalIndex
+from data_utils import PreprocessedGraphTextDataset, collate_graph_text, collate_graph_only
+
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 TEST_GRAPHS = "data/test_graphs.pkl"
-TRAIN_EMB_CSV = "data/train_embeddings.csv"
 
-FINAL_MODEL_WEIGHTS = "weights_stage2_final.pt"
+WEIGHTS_STAGE1 = "weights_stage1_clip.pt"
+WEIGHTS_STAGE2 = "weights_stage2_t5.pt"
+
 SUBMISSION_PATH = "submission.csv"
 
-# Hyperparams (identiques à training_pipeline.py)
 NODE_VOCAB = [200, 20]
 EDGE_VOCAB = [50, 20]
 HIDDEN_GRAPH = 300
-HIDDEN_TEXT = 256
-PAD_IDX = 0
+SHARED_DIM = 256
 
-# Retrieval
-INDEX_BATCH_SIZE = 32
-TOP_K = 5
-NEIGHBOR_RANK = 0  # 0 => meilleur voisin (en test il n'y a pas de leak)
+T5_NAME = "t5-base"
+PROMPT_LEN = 8
 
-# Generation (optionnel)
-DO_GENERATE_WITH_DECODER = False  # True si tu as un mapping id->token pour décoder derrière
-MAX_GEN_LEN = 200
-BOS_IDX = 1
-EOS_IDX = 2
+FIXED_PROMPT = (
+    "Rephrase the following molecular description so that it accurately reflects "
+    "the structure and roles of the given molecule:\n"
+)
+
+MAX_INPUT_LEN = 256
+MAX_NEW_TOKENS = 220
 
 
-# =========================
-# UTIL: génération greedy d'IDs (optionnel)
-# =========================
 @torch.no_grad()
-def greedy_generate_ids(model: MolecularCaptionModel, batch_graph, retrieved_ids, retrieved_mask,
-                        max_len: int = 200):
-    """
-    Renvoie une séquence d'IDs (pas de décodage texte ici).
-    model.forward attend: (batch_graph, retrieved_ids, retrieved_mask, target_ids, target_mask, target_padding_mask)
-    """
-    model.eval()
-    batch_graph = batch_graph.to(DEVICE)
-    retrieved_ids = retrieved_ids.to(DEVICE)
-    retrieved_mask = retrieved_mask.to(DEVICE)
-
-    generated = torch.tensor([[BOS_IDX]], device=DEVICE, dtype=torch.long)
-
-    for _ in range(max_len):
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(generated.size(1)).to(DEVICE)
-        tgt_pad_mask = (generated == PAD_IDX)
-
-        logits = model(
-            batch_graph,
-            retrieved_ids,
-            retrieved_mask,
-            generated,
-            tgt_mask,
-            tgt_pad_mask,
-        )  # [B, T, V]
-
-        next_token = logits[:, -1].argmax(dim=-1, keepdim=True)  # [B,1]
-        generated = torch.cat([generated, next_token], dim=1)
-
-        if next_token.item() == EOS_IDX:
-            break
-
-    return generated.squeeze(0)  # [T]
-
-
 def main():
-    # =========================
-    # Sanity checks
-    # =========================
-    if not os.path.exists(TRAIN_GRAPHS):
-        raise FileNotFoundError(f"Missing: {TRAIN_GRAPHS}")
-    if not os.path.exists(TEST_GRAPHS):
-        raise FileNotFoundError(f"Missing: {TEST_GRAPHS}")
-    if not os.path.exists(TRAIN_EMB_CSV):
-        raise FileNotFoundError(f"Missing: {TRAIN_EMB_CSV}")
-    if not os.path.exists(FINAL_MODEL_WEIGHTS):
-        raise FileNotFoundError(f"Missing: {FINAL_MODEL_WEIGHTS}")
+    for p in [TRAIN_GRAPHS, TEST_GRAPHS, WEIGHTS_STAGE1, WEIGHTS_STAGE2]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(p)
 
-    print(f"Device: {DEVICE}")
+    # Load tokenizer
+    tokenizer = T5TokenizerFast.from_pretrained(T5_NAME)
 
-    # =========================
-    # Load train embeddings (token ids stored as floats in CSV)
-    # =========================
-    print("Loading train embeddings/tokens...")
-    train_emb = load_id2emb(TRAIN_EMB_CSV)  # dict id -> Tensor(seq_len) (float)
-    ds_train = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
+    # Build CLIP model skeleton + load weights
+    graph_enc = MPNNEncoder(NODE_VOCAB, EDGE_VOCAB, hidden_dim=HIDDEN_GRAPH, num_layers=5, dropout=0.1)
+    text_enc = FrozenT5TextEncoder(T5_NAME, freeze=True)
+    clip = GraphTextCLIP(graph_enc, text_enc, graph_dim=HIDDEN_GRAPH, text_dim=768, shared_dim=SHARED_DIM).to(DEVICE)
 
-    # =========================
-    # Compute VOCAB_SIZE exactly like training_pipeline.py
-    # =========================
-    print("Scanning vocab size (same logic as training)...")
-    max_id = 0
-    temp_dl = DataLoader(ds_train, batch_size=64, shuffle=False, collate_fn=collate_fn)
-    for _, txt in tqdm(temp_dl, desc="Scan Vocab"):
-        max_id = max(max_id, txt.long().max().item())
-    vocab_size = max_id + 100
-    print(f"Detected VOCAB_SIZE: {vocab_size}")
+    s1 = torch.load(WEIGHTS_STAGE1, map_location=DEVICE)
+    clip.graph_encoder.load_state_dict(s1["graph_encoder"])
+    clip.graph_proj.load_state_dict(s1["graph_proj"])
+    clip.text_proj.load_state_dict(s1["text_proj"])
+    clip.eval()
 
-    # =========================
-    # Instantiate model EXACTLY with your class signatures
-    # =========================
-    print("Loading model...")
-    graph_encoder = DeepGINEEncoder(NODE_VOCAB, EDGE_VOCAB, HIDDEN_GRAPH)
-    text_encoder = TextEncoder(vocab_size, HIDDEN_TEXT)  # signature: (vocab_size, d_model, ...)
-    model = MolecularCaptionModel(
-        graph_encoder,
-        text_encoder,          # text_encoder_rag
-        vocab_size,
-        d_model=HIDDEN_TEXT,
-        graph_dim=HIDDEN_GRAPH
+    # Load generator (T5 LoRA + softprompt) and weights
+    gen = GraphSoftPromptT5(
+        model_name=T5_NAME,
+        graph_emb_dim=HIDDEN_GRAPH,
+        prompt_len=PROMPT_LEN,
+        lora_r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
     ).to(DEVICE)
 
-    state = torch.load(FINAL_MODEL_WEIGHTS, map_location=DEVICE)
-    model.load_state_dict(state)
-    model.eval()
-    print("Model loaded.")
+    s2 = torch.load(WEIGHTS_STAGE2, map_location=DEVICE)
+    gen.load_state_dict(s2["t5_lora_and_softprompt"])
+    gen.eval()
 
-    # =========================
-    # Build retrieval index from TRAIN (same as stage2)
-    # captions_tokens = list of tensors [seq_len] (CPU)
-    # =========================
-    print("Building retrieval index from train graphs...")
-    index_dl = DataLoader(ds_train, batch_size=INDEX_BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    # Load train dataset (to build retrieval index over train descriptions)
+    ds_train = PreprocessedGraphTextDataset(TRAIN_GRAPHS)
+    dl_train = DataLoader(ds_train, batch_size=32, shuffle=False, collate_fn=collate_graph_text)
 
-    captions_tokens = []
-    for _, caps in tqdm(index_dl, desc="Extract train captions"):
-        caps = torch.clamp(caps.long(), min=0, max=vocab_size - 1)
-        for i in range(caps.size(0)):
-            captions_tokens.append(caps[i].clone().detach().cpu())
+    train_texts = []
+    for _, descs, _ in dl_train:
+        train_texts.extend(descs)
 
     retriever = RetrievalIndex(device=DEVICE)
-    # IMPORTANT: build_index attend "for batch in dataloader: graph_batch = batch[0]"
-    # => on lui passe un dataloader qui yield (batch_graph, caps)
-    retriever.build_index(model.graph_encoder, index_dl, captions_tokens)
+    retriever.build_text_index(clip, tokenizer, train_texts, batch_size=64, max_len=MAX_INPUT_LEN)
 
-    # =========================
-    # Load train descriptions for retrieval-only submission
-    # =========================
-    # This is the only guaranteed way to output valid text with the provided codebase.
-    id2desc = load_descriptions_from_graphs(TRAIN_GRAPHS)
+    # Test loader (graphs only)
+    with open(TEST_GRAPHS, "rb") as f:
+        import pickle
+        test_graphs = pickle.load(f)
 
-    # Also keep train IDs list to map neighbor index -> train id
-    train_ids = ds_train.ids  # list aligned with ds_train order (and index order)
+    dl_test = DataLoader(test_graphs, batch_size=1, shuffle=False, collate_fn=collate_graph_only)
 
-    # =========================
-    # Load test graphs
-    # =========================
-    print("Loading test graphs...")
-    ds_test = PreprocessedGraphDataset(TEST_GRAPHS, emb_dict=None)
-    dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, collate_fn=collate_fn)
-
-    # =========================
-    # Inference
-    # =========================
-    print("Running inference on test...")
     rows = []
-
     for batch_graph in tqdm(dl_test, desc="Infer"):
-        # batch_graph is a PyG Batch (batch_size=1)
-        nn_indices, _ = retriever.query(model.graph_encoder, batch_graph, k=TOP_K)  # [1,k]
-        chosen = nn_indices[:, NEIGHBOR_RANK]  # [1]
+        # retrieve top-1
+        nn_idx, _ = retriever.query(clip, batch_graph.to(DEVICE), k=5)
+        chosen = nn_idx[:, 0]
+        retrieved = retriever.get_texts(chosen)[0]
 
-        # Map neighbor index -> train id -> description
-        neighbor_idx = int(chosen.item())
-        neighbor_id = train_ids[neighbor_idx]
-        retrieved_caption = id2desc[neighbor_id]
+        # graph emb for softprompt
+        graph_emb, _ = clip.graph_encoder(batch_graph.to(DEVICE))
 
-        if DO_GENERATE_WITH_DECODER:
-            # Build retrieved tokens for RAG memory
-            retrieved_ids = retriever.get_retrieved_tokens(chosen).to(DEVICE)  # [1, L]
-            retrieved_ids = torch.clamp(retrieved_ids.long(), min=0, max=vocab_size - 1)
-            retrieved_mask = (retrieved_ids == PAD_IDX)
+        # build input
+        inp = FIXED_PROMPT + retrieved
+        tok_in = tokenizer(inp, return_tensors="pt", truncation=True, max_length=MAX_INPUT_LEN).to(DEVICE)
 
-            # Generate ids (NO text decoding available in this repo)
-            gen_ids = greedy_generate_ids(model, batch_graph, retrieved_ids, retrieved_mask, max_len=MAX_GEN_LEN)
-            # Fallback representation: join ids (NOT Kaggle-friendly)
-            caption_out = " ".join(map(str, gen_ids.tolist()))
-        else:
-            # Retrieval-only text output (Kaggle-friendly)
-            caption_out = retrieved_caption
+        out_ids = gen.generate(
+            graph_emb=graph_emb,
+            input_ids=tok_in["input_ids"],
+            attention_mask=tok_in["attention_mask"],
+            max_new_tokens=MAX_NEW_TOKENS,
+            num_beams=4,
+            early_stopping=True,
+        )
+        out_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
 
-        # test graphs store unique id attribute
         test_id = batch_graph.id[0]
-        rows.append([test_id, caption_out])
+        rows.append([test_id, out_text])
 
-    # =========================
-    # Write submission
-    # =========================
-    print(f"Writing: {SUBMISSION_PATH}")
+    # Kaggle expects columns: ID, description
     with open(SUBMISSION_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "caption"])
-        writer.writerows(rows)
+        w = csv.writer(f)
+        w.writerow(["ID", "description"])
+        w.writerows(rows)
 
-    print("Done. submission.csv ready.")
+    print("Wrote", SUBMISSION_PATH)
 
 
 if __name__ == "__main__":

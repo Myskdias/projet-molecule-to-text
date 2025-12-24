@@ -1,69 +1,58 @@
 import torch
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
+
 
 class RetrievalIndex:
     """
-    Gestionnaire de la base de connaissances (Vector Database).
+    Stores text embeddings + raw text.
+    Query with graph embeddings (same shared space).
     """
-    def __init__(self, device='cuda'):
+    def __init__(self, device="cuda"):
         self.device = device
-        self.database_embeddings = None # [N, Dim]
-        self.train_captions_tokens = [] # Liste de tenseurs [Seq_Len]
+        self.text_emb = None          # [N, D] (on device)
+        self.texts = None             # list[str]
 
-    def build_index(self, encoder, dataloader, captions_tokens_list):
+    @torch.no_grad()
+    def build_text_index(self, clip_model, tokenizer, train_texts, batch_size=64, max_len=256):
         """
-        Construit l'index en passant tout le dataset dans l'encodeur.
-        Utilise l'encodeur (potentiellement pré-entraîné CLIP) pour vectoriser les graphes.
+        clip_model.encode_text(...) must return normalized vectors in shared space.
         """
-        encoder.eval()
-        encoder.to(self.device)
-        self.train_captions_tokens = captions_tokens_list
-        embeddings_list = []
-        
-        print("Construction de l'Index Vectoriel...")
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Indexing"):
-                graph_batch = batch[0].to(self.device)
-                
-                # On récupère le vecteur global du graphe (sortie 1)
-                graph_emb, _ = encoder(graph_batch)
-                
-                # Normalisation L2 (pour similarité cosinus)
-                graph_emb = F.normalize(graph_emb, p=2, dim=1)
-                
-                # Stockage CPU pour éviter OOM
-                embeddings_list.append(graph_emb.cpu())
-        
-        self.database_embeddings = torch.cat(embeddings_list, dim=0).to(self.device)
-        print(f"Index prêt. {self.database_embeddings.shape[0]} molécules indexées.")
+        clip_model.eval()
+        all_vecs = []
+        self.texts = list(train_texts)
 
-    def query(self, encoder, query_batch, k=3):
-        """
-        Recherche les k plus proches voisins pour un batch de requêtes.
-        """
-        encoder.eval()
-        with torch.no_grad():
-            query_batch = query_batch.to(self.device)
-            query_emb, _ = encoder(query_batch)
-            query_emb = F.normalize(query_emb, p=2, dim=1)
-            
-            # Produit scalaire (Cosinus Similarity sur vecteurs normalisés)
-            # [Batch, Dim] @ [Dim, N] -> [Batch, N]
-            similarity = torch.mm(query_emb, self.database_embeddings.t())
-            
-            scores, indices = torch.topk(similarity, k=k, dim=1)
-            return indices, scores
+        for i in tqdm(range(0, len(train_texts), batch_size), desc="Index texts"):
+            batch_txt = train_texts[i:i+batch_size]
+            tok = tokenizer(
+                batch_txt,
+                padding=True,
+                truncation=True,
+                max_length=max_len,
+                return_tensors="pt",
+            ).to(self.device)
+            v = clip_model.encode_text(tok["input_ids"], tok["attention_mask"])  # [B,D], normalized
+            all_vecs.append(v.detach().cpu())
 
-    def get_retrieved_tokens(self, indices):
+        self.text_emb = torch.cat(all_vecs, dim=0).to(self.device)
+        self.text_emb = F.normalize(self.text_emb, dim=1)
+        return self
+
+    @torch.no_grad()
+    def query(self, clip_model, batch_graph, k=5):
         """
-        Renvoie les tokens des textes associés aux indices trouvés.
-        Gère le padding dynamique.
+        Returns: indices [B,k], scores [B,k]
         """
-        indices_cpu = indices.cpu().tolist()
-        batch_tokens = [self.train_captions_tokens[idx] for idx in indices_cpu]
-        
-        # Padding avec 0 (supposé PAD_IDX)
-        padded_tokens = pad_sequence(batch_tokens, batch_first=True, padding_value=0)
-        return padded_tokens.long()
+        clip_model.eval()
+        batch_graph = batch_graph.to(self.device)
+        q = clip_model.encode_graph(batch_graph)  # [B,D], normalized
+        sims = q @ self.text_emb.t()              # [B,N]
+        scores, idx = torch.topk(sims, k=k, dim=1)
+        return idx, scores
+
+    def get_texts(self, indices_1d):
+        """
+        indices_1d: shape [B] on cpu or gpu
+        """
+        idx = indices_1d.detach().cpu().tolist()
+        return [self.texts[i] for i in idx]

@@ -1,172 +1,228 @@
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from torch_geometric.nn import GINEConv, global_add_pool
+
+from torch_geometric.nn import MessagePassing, global_add_pool
 from torch_geometric.utils import to_dense_batch
 
+from transformers import T5ForConditionalGeneration, T5EncoderModel
+from peft import LoraConfig, get_peft_model
+
+
 # ==========================================
-# 1. COMPOSANTS DE BASE (EMBEDDINGS)
+# 1) Embedders for categorical node/edge feats
 # ==========================================
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
-
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
-
 class AtomEncoder(nn.Module):
-    def __init__(self, hidden_dim, list_of_vocab_sizes):
+    def __init__(self, hidden_dim: int, list_of_vocab_sizes):
         super().__init__()
         self.embeddings = nn.ModuleList([nn.Embedding(v, hidden_dim) for v in list_of_vocab_sizes])
-        for emb in self.embeddings: nn.init.xavier_uniform_(emb.weight.data)
-    def forward(self, x):
+        for emb in self.embeddings:
+            nn.init.xavier_uniform_(emb.weight.data)
+
+    def forward(self, x_cat: torch.Tensor) -> torch.Tensor:
+        # x_cat: [N, F] categorical ints
         out = 0
-        for i, emb in enumerate(self.embeddings): out += emb(x[:, i])
+        for i, emb in enumerate(self.embeddings):
+            out = out + emb(x_cat[:, i])
         return out
+
 
 class BondEncoder(nn.Module):
-    def __init__(self, hidden_dim, list_of_vocab_sizes):
+    def __init__(self, hidden_dim: int, list_of_vocab_sizes):
         super().__init__()
         self.embeddings = nn.ModuleList([nn.Embedding(v, hidden_dim) for v in list_of_vocab_sizes])
-        for emb in self.embeddings: nn.init.xavier_uniform_(emb.weight.data)
-    def forward(self, edge_attr):
+        for emb in self.embeddings:
+            nn.init.xavier_uniform_(emb.weight.data)
+
+    def forward(self, edge_attr_cat: torch.Tensor) -> torch.Tensor:
+        # edge_attr_cat: [E, Fe] categorical ints
         out = 0
-        for i, emb in enumerate(self.embeddings): out += emb(edge_attr[:, i])
+        for i, emb in enumerate(self.embeddings):
+            out = out + emb(edge_attr_cat[:, i])
         return out
 
-# ==========================================
-# 2. ENCODEURS (GRAPH & TEXT)
-# ==========================================
 
-class DeepGINEEncoder(nn.Module):
-    """Encodeur de Graphe (L'Oeil du modèle)"""
-    def __init__(self, num_node_vocab, num_edge_vocab, hidden_dim=300, num_layers=5, dropout=0.5):
-        super().__init__()
-        self.num_layers = num_layers
+# ==========================================
+# 2) MPNN layer using edge embeddings
+# ==========================================
+class MPNNLayer(MessagePassing):
+    def __init__(self, hidden_dim: int, edge_dim: int, dropout: float = 0.1):
+        super().__init__(aggr="add")
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + edge_dim, 2 * hidden_dim),
+            nn.ReLU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+        self.upd_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim, 2 * hidden_dim),
+            nn.ReLU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+        self.norm = nn.BatchNorm1d(hidden_dim)
         self.dropout = dropout
+
+    def forward(self, x, edge_index, edge_attr):
+        # edge_attr already embedded: [E, edge_dim]
+        m = self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr)
+        out = self.upd_mlp(torch.cat([x, m], dim=-1))
+        out = self.norm(out)
+        out = F.relu(out)
+        out = F.dropout(out, p=self.dropout, training=self.training)
+        # residual
+        return out + x
+
+    def message(self, x_j, edge_attr):
+        return self.msg_mlp(torch.cat([x_j, edge_attr], dim=-1))
+
+
+# ==========================================
+# 3) Graph encoder MPNN
+# ==========================================
+class MPNNEncoder(nn.Module):
+    """
+    Returns:
+      graph_emb: [B, hidden_dim]
+      node_emb:  [N_total, hidden_dim]
+    """
+    def __init__(self, num_node_vocab, num_edge_vocab, hidden_dim=300, num_layers=5, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
         self.atom_encoder = AtomEncoder(hidden_dim, num_node_vocab)
         self.bond_encoder = BondEncoder(hidden_dim, num_edge_vocab)
-        self.convs = nn.ModuleList()
-        self.batch_norms = nn.ModuleList()
-
-        for _ in range(num_layers):
-            mlp = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.BatchNorm1d(hidden_dim * 2), nn.ReLU(),
-                nn.Linear(hidden_dim * 2, hidden_dim)
-            )
-            self.convs.append(GINEConv(mlp, train_eps=True))
-            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+        self.layers = nn.ModuleList([MPNNLayer(hidden_dim, hidden_dim, dropout=dropout) for _ in range(num_layers)])
 
     def forward(self, data):
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
-        x = self.atom_encoder(x)
-        edge_emb = self.bond_encoder(edge_attr)
+        x = self.atom_encoder(x)                        # [N, H]
+        e = self.bond_encoder(edge_attr)                # [E, H]
+        for layer in self.layers:
+            x = layer(x, edge_index, e)
 
-        for i in range(self.num_layers):
-            identity = x
-            x = self.convs[i](x, edge_index, edge_attr=edge_emb)
-            x = self.batch_norms[i](x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = x + identity # Skip connection
-
-        graph_emb = global_add_pool(x, batch)
+        graph_emb = global_add_pool(x, batch)           # [B, H]
         return graph_emb, x
 
-class TextEncoder(nn.Module):
-    """Encodeur de Texte (Utilisé pour CLIP et pour lire l'antisèche RAG)"""
-    def __init__(self, vocab_size, d_model, nhead=4, num_layers=2, dropout=0.1):
+
+# ==========================================
+# 4) Text encoder for retrieval = frozen T5 encoder
+# ==========================================
+class FrozenT5TextEncoder(nn.Module):
+    """
+    Encodes tokenized text to a single embedding using T5 encoder (frozen by default).
+    """
+    def __init__(self, model_name: str = "t5-base", freeze: bool = True):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-    def forward(self, src, src_key_padding_mask=None):
-        x = self.embedding(src)
-        x = self.pos_encoder(x)
-        return self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
+        self.enc = T5EncoderModel.from_pretrained(model_name)
+        if freeze:
+            for p in self.enc.parameters():
+                p.requires_grad = False
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # last_hidden_state: [B, L, d_model]
+        out = self.enc(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        # masked mean pooling
+        mask = attention_mask.unsqueeze(-1).float()  # [B,L,1]
+        pooled = (out * mask).sum(dim=1) / (mask.sum(dim=1).clamp(min=1.0))
+        return pooled  # [B, d_model]
+
 
 # ==========================================
-# 3. MODULE ÉTAPE 1 : CLIP (ALIGNEMENT)
+# 5) Stage-1: CLIP-like aligner (graph->shared, text->shared)
 # ==========================================
-
 class GraphTextCLIP(nn.Module):
-    """Modèle pour l'étape 1 : Apprend à aligner Graphe et Texte"""
-    def __init__(self, graph_encoder, text_encoder, graph_dim, text_dim, shared_dim=256):
+    def __init__(self, graph_encoder: nn.Module, text_encoder: nn.Module,
+                 graph_dim: int, text_dim: int, shared_dim: int = 256):
         super().__init__()
         self.graph_encoder = graph_encoder
         self.text_encoder = text_encoder
         self.graph_proj = nn.Linear(graph_dim, shared_dim)
         self.text_proj = nn.Linear(text_dim, shared_dim)
-        self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052) # ln(100) ~ 4.6
+        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
 
-    def forward(self, batch_graph, batch_text, text_mask):
-        # Encodage Graphe
-        graph_feat, _ = self.graph_encoder(batch_graph)
-        graph_emb = self.graph_proj(graph_feat)
-        
-        # Encodage Texte
-        text_seq = self.text_encoder(batch_text, src_key_padding_mask=text_mask)
-        # Pooling: On prend la moyenne des tokens non-padded (simplifié ici par mean global)
-        text_feat = text_seq.mean(dim=1) 
-        text_emb = self.text_proj(text_feat)
-        
-        # Normalisation L2 (Crucial pour CLIP)
-        return F.normalize(graph_emb, dim=1), F.normalize(text_emb, dim=1)
+    def encode_graph(self, batch_graph) -> torch.Tensor:
+        g, _ = self.graph_encoder(batch_graph)      # [B, graph_dim]
+        g = self.graph_proj(g)                      # [B, shared]
+        return F.normalize(g, dim=1)
+
+    def encode_text(self, input_ids, attention_mask) -> torch.Tensor:
+        t = self.text_encoder(input_ids, attention_mask)  # [B, text_dim]
+        t = self.text_proj(t)                             # [B, shared]
+        return F.normalize(t, dim=1)
+
+    def forward(self, batch_graph, input_ids, attention_mask):
+        return self.encode_graph(batch_graph), self.encode_text(input_ids, attention_mask)
+
 
 # ==========================================
-# 4. MODULE ÉTAPE 2 : GÉNÉRATEUR RAG
+# 6) Stage-2: Graph-conditioned T5 with soft prompt + LoRA
 # ==========================================
-
-class MolecularCaptionModel(nn.Module):
-    """Modèle pour l'étape 2 : Génération assistée (RAG)"""
-    def __init__(self, graph_encoder, text_encoder_rag, vocab_size, d_model=256, graph_dim=300):
+class GraphSoftPromptT5(nn.Module):
+    def __init__(
+        self,
+        model_name: str = "t5-base",
+        graph_emb_dim: int = 300,
+        prompt_len: int = 8,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        target_modules=("q", "v"),
+    ):
         super().__init__()
-        self.graph_encoder = graph_encoder
-        # Note : On peut réutiliser le text_encoder de CLIP comme "lecteur d'antisèche"
-        self.retrieved_text_encoder = text_encoder_rag 
-        
-        self.graph_projector = nn.Linear(graph_dim, d_model)
-        
-        # Décodeur (L'écrivain)
-        self.tgt_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model)
-        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=4, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
-        self.fc_out = nn.Linear(d_model, vocab_size)
+        self.prompt_len = prompt_len
 
-    def forward(self, batch_graph, retrieved_ids, retrieved_mask, target_ids, target_mask, target_padding_mask):
-        # A. Traitement Graphe
-        _, graph_node_emb = self.graph_encoder(batch_graph)
-        graph_feats, graph_mask = to_dense_batch(graph_node_emb, batch_graph.batch)
-        graph_feats = self.graph_projector(graph_feats)
-        
-        # B. Traitement Antisèche (RAG)
-        retrieved_feats = self.retrieved_text_encoder(retrieved_ids, src_key_padding_mask=retrieved_mask)
-        
-        # C. Fusion (Concaténation)
-        memory = torch.cat([graph_feats, retrieved_feats], dim=1)
-        graph_padding_mask = ~graph_mask
-        memory_key_padding_mask = torch.cat([graph_padding_mask, retrieved_mask], dim=1)
-        
-        # D. Décodage
-        tgt_emb = self.pos_encoder(self.tgt_embedding(target_ids))
-        output = self.transformer_decoder(
-            tgt_emb, memory, 
-            tgt_mask=target_mask, 
-            tgt_key_padding_mask=target_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
+        self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
+
+        # LoRA on attention projections
+        lora_cfg = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="SEQ_2_SEQ_LM",
+            target_modules=list(target_modules),
         )
-        return self.fc_out(output)
+        self.t5 = get_peft_model(self.t5, lora_cfg)
+
+        d_model = self.t5.config.d_model
+
+        # soft prompt MLP: graph_emb -> (prompt_len * d_model)
+        self.softprompt = nn.Sequential(
+            nn.Linear(graph_emb_dim, 2 * graph_emb_dim),
+            nn.ReLU(),
+            nn.Linear(2 * graph_emb_dim, prompt_len * d_model),
+        )
+
+    def _build_inputs_embeds(self, graph_emb: torch.Tensor, input_ids: torch.Tensor):
+        """
+        graph_emb: [B, graph_emb_dim]
+        input_ids: [B, L]
+        returns inputs_embeds: [B, prompt_len + L, d_model]
+        """
+        B = graph_emb.size(0)
+        d_model = self.t5.config.d_model
+
+        sp = self.softprompt(graph_emb).view(B, self.prompt_len, d_model)  # [B,k,d]
+        tok_emb = self.t5.get_input_embeddings()(input_ids)               # [B,L,d]
+        return torch.cat([sp, tok_emb], dim=1)
+
+    def forward(self, graph_emb, input_ids, attention_mask=None, labels=None):
+        inputs_embeds = self._build_inputs_embeds(graph_emb, input_ids)
+
+        if attention_mask is not None:
+            B = attention_mask.size(0)
+            sp_mask = torch.ones(B, self.prompt_len, device=attention_mask.device, dtype=attention_mask.dtype)
+            attention_mask = torch.cat([sp_mask, attention_mask], dim=1)
+
+        return self.t5(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
+
+    @torch.no_grad()
+    def generate(self, graph_emb, input_ids, attention_mask=None, **gen_kwargs):
+        inputs_embeds = self._build_inputs_embeds(graph_emb, input_ids)
+        if attention_mask is not None:
+            B = attention_mask.size(0)
+            sp_mask = torch.ones(B, self.prompt_len, device=attention_mask.device, dtype=attention_mask.dtype)
+            attention_mask = torch.cat([sp_mask, attention_mask], dim=1)
+        return self.t5.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **gen_kwargs)

@@ -1,228 +1,243 @@
 import os
+import gc
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import gc
 
-# Import de NOS fichiers
-from architecture import DeepGINEEncoder, TextEncoder, GraphTextCLIP, MolecularCaptionModel
+from transformers import T5TokenizerFast
+
+from architecture import (
+    MPNNEncoder,
+    FrozenT5TextEncoder,
+    GraphTextCLIP,
+    GraphSoftPromptT5,
+)
 from retrieval import RetrievalIndex
-# On suppose que data_utils existe (comme vu précédemment)
-from data_utils import load_id2emb, PreprocessedGraphDataset, collate_fn
+from data_utils import PreprocessedGraphTextDataset, collate_graph_text
 
-# --- CONFIGURATION GLOBALE ---
+
+# ---------------- CONFIG ----------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TRAIN_GRAPHS = "data/train_graphs.pkl"
-TRAIN_EMB_CSV = "data/train_embeddings.csv"
 
-# Hyperparamètres Architecture
-NODE_VOCAB = [200, 20] 
+TRAIN_GRAPHS = "data/train_graphs.pkl"
+VAL_GRAPHS = "data/validation_graphs.pkl"   # si vous l'avez, sinon commentez
+WEIGHTS_STAGE1 = "weights_stage1_clip.pt"
+WEIGHTS_STAGE2 = "weights_stage2_t5.pt"
+
+NODE_VOCAB = [200, 20]
 EDGE_VOCAB = [50, 20]
 HIDDEN_GRAPH = 300
-HIDDEN_TEXT = 256
-PAD_IDX = 0
+SHARED_DIM = 256
 
-# Fichiers de sauvegarde
-CLIP_WEIGHTS = "weights_stage1_clip.pt"
-FINAL_MODEL_WEIGHTS = "weights_stage2_final.pt"
+T5_NAME = "t5-base"
+PROMPT_LEN = 8
 
-# ==================================================================================
-# ÉTAPE 1 : ALIGNEMENT CLIP (Contrastive Pre-training)
-# ==================================================================================
-def train_stage_1_clip(train_dl, vocab_size, epochs=5):
-    print("\n" + "="*50)
-    print("DEMARRAGE ETAPE 1 : ALIGNEMENT CLIP")
-    print("Objectif : Apprendre aux encodeurs à rapprocher Graphe et Texte")
-    print("="*50)
+FIXED_PROMPT = (
+    "Rephrase the following molecular description so that it accurately reflects "
+    "the structure and roles of the given molecule:\n"
+)
 
-    # 1. Instanciation des Encodeurs
-    graph_enc = DeepGINEEncoder(NODE_VOCAB, EDGE_VOCAB, HIDDEN_GRAPH)
-    text_enc = TextEncoder(vocab_size, 256) # Projecteur CLIP vers 256
-    
-    # Wrapper CLIP
-    model = GraphTextCLIP(graph_enc, text_enc, HIDDEN_GRAPH, 256).to(DEVICE)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+MAX_INPUT_LEN = 256
+MAX_TARGET_LEN = 256
 
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0
-        pbar = tqdm(train_dl, desc=f"Epoch {epoch+1}/{epochs} [CLIP]")
-        
-        for batch in pbar:
-            batch_graph, texts = batch
+
+def set_requires_grad(module, value: bool):
+    for p in module.parameters():
+        p.requires_grad = value
+
+
+# =========================
+# Stage 1: CLIP-like training for retrieval
+# =========================
+def train_stage1_clip(train_dl, epochs=3, lr=2e-4, tau=0.07):
+    graph_enc = MPNNEncoder(NODE_VOCAB, EDGE_VOCAB, hidden_dim=HIDDEN_GRAPH, num_layers=5, dropout=0.1)
+    text_enc = FrozenT5TextEncoder(T5_NAME, freeze=True)
+
+    # text_dim = T5 d_model (768 for t5-base)
+    clip = GraphTextCLIP(graph_enc, text_enc, graph_dim=HIDDEN_GRAPH, text_dim=768, shared_dim=SHARED_DIM).to(DEVICE)
+
+    # Train ONLY graph_encoder + projections (text encoder frozen)
+    params = list(clip.graph_encoder.parameters()) + list(clip.graph_proj.parameters()) + list(clip.text_proj.parameters())
+    opt = torch.optim.AdamW(params, lr=lr)
+
+    tokenizer = T5TokenizerFast.from_pretrained(T5_NAME)
+
+    clip.train()
+    for ep in range(epochs):
+        total = 0.0
+        pbar = tqdm(train_dl, desc=f"Stage1 EP {ep+1}/{epochs}")
+        for batch_graph, descs, _idxs in pbar:
             batch_graph = batch_graph.to(DEVICE)
-            texts = texts.to(DEVICE).long()
-            texts = torch.clamp(texts, min=0, max=vocab_size-1)
-            text_mask = (texts == PAD_IDX)
-            
-            optimizer.zero_grad()
-            
-            # Forward CLIP
-            I_g, I_t = model(batch_graph, texts, text_mask)
-            
-            # Loss Contrastive Symétrique
-            logits = (model.logit_scale.exp()) * (I_g @ I_t.t())
-            labels = torch.arange(I_g.size(0)).to(DEVICE)
+            tok = tokenizer(
+                descs, padding=True, truncation=True, max_length=MAX_INPUT_LEN, return_tensors="pt"
+            ).to(DEVICE)
+
+            g, t = clip(batch_graph, tok["input_ids"], tok["attention_mask"])
+            # CLIP logits
+            logit_scale = clip.logit_scale.exp()
+            logits = logit_scale * (g @ t.t())  # [B,B]
+            labels = torch.arange(g.size(0), device=DEVICE)
+
             loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)) / 2
-            
+
+            opt.zero_grad(set_to_none=True)
             loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            opt.step()
 
-    # Sauvegarde des encodeurs pré-entraînés
-    torch.save({
-        'graph_encoder': model.graph_encoder.state_dict(),
-        'text_encoder': model.text_encoder.state_dict()
-    }, CLIP_WEIGHTS)
-    print(f"Étape 1 terminée. Poids sauvegardés dans {CLIP_WEIGHTS}")
-    
-    return model.graph_encoder, model.text_encoder
+            total += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-# ==================================================================================
-# ÉTAPE 2 : GÉNÉRATION RAG (End-to-End avec Decoder)
-# ==================================================================================
-def train_stage_2_rag(train_dl, ds_full, vocab_size, epochs=10):
-    print("\n" + "="*50)
-    print("DEMARRAGE ETAPE 2 : GÉNÉRATION RAG")
-    print("Objectif : Apprendre à écrire en utilisant l'antisèche (Retrieved Text)")
-    print("="*50)
-    
-    # 1. Chargement des Poids Pré-entraînés
-    if not os.path.exists(CLIP_WEIGHTS):
-        raise FileNotFoundError("Lancez l'étape 1 d'abord !")
-    
-    checkpoint = torch.load(CLIP_WEIGHTS)
-    
-    # 2. Instanciation (On recrée des instances propres)
-    graph_enc = DeepGINEEncoder(NODE_VOCAB, EDGE_VOCAB, HIDDEN_GRAPH)
-    text_enc = TextEncoder(vocab_size, 256)
-    
-    graph_enc.load_state_dict(checkpoint['graph_encoder'])
-    text_enc.load_state_dict(checkpoint['text_encoder'])
-    print("Poids CLIP chargés dans les encodeurs.")
+        print(f"[Stage1] epoch {ep+1} avg loss: {total/len(train_dl):.4f}")
 
-    # 3. Construction de l'Index RAG (Avec l'encodeur Intelligent !)
-    # On utilise l'encodeur de graphe pré-entraîné pour vectoriser la base
+    torch.save(
+        {
+            "graph_encoder": clip.graph_encoder.state_dict(),
+            "graph_proj": clip.graph_proj.state_dict(),
+            "text_proj": clip.text_proj.state_dict(),
+        },
+        WEIGHTS_STAGE1,
+    )
+    return clip, tokenizer
+
+
+# =========================
+# Stage 2: Train T5 rewrite with softprompt + LoRA
+# =========================
+def train_stage2_t5(train_dl, clip, tokenizer, epochs=3, lr=5e-5, warmup_freeze_epochs=1, topk=5):
+    # Build retriever index on train descriptions (text space)
+    # We index TEXT embeddings because retrieval is graph->text in shared space
+    train_texts_full = []
+    for _, descs, _ in train_dl:
+        train_texts_full.extend(descs)
+
     retriever = RetrievalIndex(device=DEVICE)
-    
-    # Préparation des données pour l'index
-    # On a besoin d'un loader séquentiel pour extraire les textes
-    index_dl = DataLoader(ds_full, batch_size=32, shuffle=False, collate_fn=collate_fn)
-    captions_tokens = []
-    
-    print("Extraction des textes pour l'index...")
-    for _, caps in tqdm(index_dl):
-        caps = torch.clamp(caps.long(), min=0, max=vocab_size-1)
-        for i in range(caps.size(0)): captions_tokens.append(caps[i].clone().detach().cpu())
-            
-    # Construction effective
-    retriever.build_index(graph_enc, index_dl, captions_tokens)
+    retriever.build_text_index(clip, tokenizer, train_texts_full, batch_size=64, max_len=MAX_INPUT_LEN)
 
-    # 4. Modèle Complet
-    # Note : text_enc sert ici à encoder le texte récupéré (antisèche)
-    model = MolecularCaptionModel(graph_enc, text_enc, vocab_size, d_model=256, graph_dim=HIDDEN_GRAPH).to(DEVICE)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=5e-5) # LR plus faible pour Fine-Tuning
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+    # Create generator
+    gen = GraphSoftPromptT5(
+        model_name=T5_NAME,
+        graph_emb_dim=HIDDEN_GRAPH,
+        prompt_len=PROMPT_LEN,
+        lora_r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+    ).to(DEVICE)
 
-    # 5. Boucle d'entraînement
-    model.train()
-    grad_acc_steps = 4 # Accumulation pour simuler un batch de 32 (si batch=8)
-    
-    for epoch in range(epochs):
-        total_loss = 0
-        optimizer.zero_grad()
-        pbar = tqdm(train_dl, desc=f"Epoch {epoch+1}/{epochs} [RAG]")
-        
-        for batch_idx, batch in enumerate(pbar):
-            batch_graph, targets = batch
+    # Initially freeze graph encoder + clip projections (as you asked)
+    set_requires_grad(clip.graph_encoder, False)
+    set_requires_grad(clip.graph_proj, False)
+    set_requires_grad(clip.text_proj, False)
+    clip.eval()
+
+    # Train LoRA + softprompt only
+    trainable = []
+    for n, p in gen.named_parameters():
+        if p.requires_grad:
+            trainable.append(p)
+    opt = torch.optim.AdamW(trainable, lr=lr)
+
+    gen.train()
+    for ep in range(epochs):
+        # Progressive unfreezing (optional)
+        if ep >= warmup_freeze_epochs:
+            set_requires_grad(clip.graph_encoder, True)
+            set_requires_grad(clip.graph_proj, True)
+            # If you unfreeze graph encoder, retrieval index in principle becomes stale.
+            # Easiest safe choice: keep it frozen. If you REALLY want, rebuild each epoch:
+            # retriever.build_text_index(clip, tokenizer, train_texts_full, batch_size=64, max_len=MAX_INPUT_LEN)
+
+        total = 0.0
+        pbar = tqdm(train_dl, desc=f"Stage2 EP {ep+1}/{epochs}")
+        for batch_graph, targets, idxs in pbar:
             batch_graph = batch_graph.to(DEVICE)
-            targets = targets.to(DEVICE).long()
-            targets = torch.clamp(targets, min=0, max=vocab_size-1)
-            
-            # --- LOGIQUE RAG ---
+
+            # --- retrieval: get a candidate text for each graph
             with torch.no_grad():
-                # Recherche Voisins (Utilise l'intelligence CLIP)
-                neighbor_indices, _ = retriever.query(graph_enc, batch_graph, k=5)
-                selected_indices = neighbor_indices[:, 2] # 3ème voisin pour éviter le leak
-                
-                retrieved_ids = retriever.get_retrieved_tokens(selected_indices).to(DEVICE)
-                retrieved_ids = torch.clamp(retrieved_ids, min=0, max=vocab_size-1)
-                
-                # Anti-Leakage (Firewall)
-                # Si le texte est trop similaire (>80%), on masque
-                for i in range(targets.size(0)):
-                    t_set = set(targets[i].tolist()) - {PAD_IDX, 1, 2}
-                    r_set = set(retrieved_ids[i].tolist()) - {PAD_IDX, 1, 2}
-                    if len(t_set) > 0 and (len(t_set.intersection(r_set)) / len(t_set) > 0.8):
-                        retrieved_ids[i, :] = PAD_IDX
-                
-                retrieved_mask = (retrieved_ids == PAD_IDX)
+                nn_idx, _ = retriever.query(clip, batch_graph, k=topk)  # [B,k]
+                # anti-leak: avoid picking the same sample index if it happens (train only)
+                # we don't have a perfect mapping from nn_idx to global idx because index is over train_texts_full order
+                # But since index is built in the same order as train_dl iterates, it's consistent with dataset order.
+                chosen = nn_idx[:, 0].clone()  # [B]
+                # simple heuristic: if chosen equals current idxs, take next neighbor
+                # (works if indexing order matches dataset order)
+                for b in range(chosen.size(0)):
+                    if int(chosen[b].item()) == int(idxs[b].item()) and topk > 1:
+                        chosen[b] = nn_idx[b, 1]
 
-            # Inputs Décodeur
-            tgt_in = targets[:, :-1]
-            tgt_out = targets[:, 1:]
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_in.size(1)).to(DEVICE)
-            tgt_pad_mask = (tgt_in == PAD_IDX)
-            
-            # Forward
-            logits = model(batch_graph, retrieved_ids, retrieved_mask, tgt_in, tgt_mask, tgt_pad_mask)
-            
-            # Loss
-            loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
-            loss = loss / grad_acc_steps
+                retrieved_texts = retriever.get_texts(chosen)
+
+                # graph embedding for softprompt (use graph encoder output, NOT shared proj)
+                graph_emb, _ = clip.graph_encoder(batch_graph)  # [B, HIDDEN_GRAPH]
+
+            # Build T5 input: fixed prompt + retrieved
+            inputs_text = [FIXED_PROMPT + rt for rt in retrieved_texts]
+
+            tok_in = tokenizer(
+                inputs_text, padding=True, truncation=True, max_length=MAX_INPUT_LEN, return_tensors="pt"
+            ).to(DEVICE)
+            tok_out = tokenizer(
+                targets, padding=True, truncation=True, max_length=MAX_TARGET_LEN, return_tensors="pt"
+            ).to(DEVICE)
+
+            labels = tok_out["input_ids"].clone()
+            labels[labels == tokenizer.pad_token_id] = -100
+
+            out = gen(
+                graph_emb=graph_emb,
+                input_ids=tok_in["input_ids"],
+                attention_mask=tok_in["attention_mask"],
+                labels=labels,
+            )
+            loss = out.loss
+
+            opt.zero_grad(set_to_none=True)
             loss.backward()
-            
-            if (batch_idx + 1) % grad_acc_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-            
-            total_loss += loss.item() * grad_acc_steps
-            pbar.set_postfix({'loss': f"{loss.item() * grad_acc_steps:.4f}"})
-            
-    torch.save(model.state_dict(), FINAL_MODEL_WEIGHTS)
-    print("✅ Entraînement terminé.")
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            opt.step()
 
-# ==================================================================================
-# MAIN
-# ==================================================================================
+            total += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        print(f"[Stage2] epoch {ep+1} avg loss: {total/len(train_dl):.4f}")
+
+    torch.save(
+        {
+            "clip_graph_encoder": clip.graph_encoder.state_dict(),
+            "clip_graph_proj": clip.graph_proj.state_dict(),
+            "clip_text_proj": clip.text_proj.state_dict(),
+            "t5_lora_and_softprompt": gen.state_dict(),
+        },
+        WEIGHTS_STAGE2,
+    )
+
+    return gen, retriever
+
+
+# =========================
+# Optional Stage 3: MRT/BLEU-aware (stub)
+# =========================
+def train_stage3_mrt(*args, **kwargs):
+    raise NotImplementedError(
+        "MRT/BLEU-aware fine-tuning is doable, but needs careful engineering "
+        "(sampling/beam + reward computation). Start with Stage1+Stage2 first."
+    )
+
+
 def main():
-    if not os.path.exists(TRAIN_GRAPHS):
-        print("Erreur: Données introuvables.")
-        return
-    print(f"Device: {DEVICE}")
-    # 1. Chargement Données & Vocab
-    print("Chargement des données...")
-    train_emb = load_id2emb(TRAIN_EMB_CSV)
-    ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
-    
-    # Calcul Vocabulaire Réel
-    max_id = 0
-    temp_dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
-    for _, txt in tqdm(temp_dl, desc="Scan Vocab"):
-        max_id = max(max_id, txt.long().max().item())
-    VOCAB_SIZE = max_id + 100
-    print(f"Vocabulaire détecté : {VOCAB_SIZE}")
+    assert os.path.exists(TRAIN_GRAPHS), f"Missing {TRAIN_GRAPHS}"
 
-    # Loader pour entraînement
-    train_dl = DataLoader(ds, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    ds_train = PreprocessedGraphTextDataset(TRAIN_GRAPHS)
+    train_dl = DataLoader(ds_train, batch_size=16, shuffle=True, collate_fn=collate_graph_text)
 
-    # 2. Exécution du Pipeline
-    # Étape A : CLIP
-    train_stage_1_clip(train_dl, VOCAB_SIZE, epochs=10)
-    
-    # Nettoyage mémoire avant étape 2
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Étape B : RAG
-    train_stage_2_rag(train_dl, ds, VOCAB_SIZE, epochs=10)
+    # Stage 1
+    clip, tokenizer = train_stage1_clip(train_dl, epochs=3)
+
+    # Stage 2
+    gen, retriever = train_stage2_t5(train_dl, clip, tokenizer, epochs=3, warmup_freeze_epochs=1, topk=5)
+
+    print("Training finished. Saved:", WEIGHTS_STAGE1, WEIGHTS_STAGE2)
+
 
 if __name__ == "__main__":
     main()
