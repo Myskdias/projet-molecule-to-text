@@ -99,12 +99,17 @@ from tqdm import tqdm
 from transformers import T5TokenizerFast
 
 # Modules du projet
-from data_utils import PreprocessedGraphTestDataset, collate_graph_only
 from architecture import (
     MPNNEncoder,
     FrozenT5TextEncoder,
     GraphTextCLIP,
     GraphSoftPromptT5,
+)
+from data_utils import (
+    PreprocessedGraphTestDataset, 
+    collate_graph_only,
+    PreprocessedGraphTextDataset, 
+    collate_graph_text
 )
 from retrieval import RetrievalIndex
 
@@ -216,12 +221,28 @@ def run_inference(cfg: InferenceConfig):
     => résultats invalides
     """
 
+    # --------------------------------------------------------
+# Inférer dynamiquement les tailles de vocabulaire
+# --------------------------------------------------------
+    dummy_graph = PreprocessedGraphTextDataset(
+        "data/train_graphs.pkl"
+    )[0][0]  # graph only
+
+    node_vocab_sizes = [
+        int(dummy_graph.x[:, i].max().item() + 1)
+        for i in range(dummy_graph.x.size(1))
+    ]
+
+    edge_vocab_sizes = [
+        int(dummy_graph.edge_attr[:, i].max().item() + 1)
+        for i in range(dummy_graph.edge_attr.size(1))
+    ]
+
     graph_encoder = MPNNEncoder(
-        node_vocab_sizes=None,  # ⚠️ À fournir depuis data_utils (x_map)
-        edge_vocab_sizes=None,  # ⚠️ À fournir depuis data_utils (e_map)
+        node_vocab_sizes=node_vocab_sizes,
+        edge_vocab_sizes=edge_vocab_sizes,
         hidden_dim=cfg.hidden_graph,
     ).to(device)
-
     text_encoder = FrozenT5TextEncoder(cfg.t5_name, freeze=True)
 
     clip = GraphTextCLIP(
@@ -273,6 +294,18 @@ def run_inference(cfg: InferenceConfig):
     # Placeholder :
     # retriever = RetrievalIndex(...)
     # retriever.build(train_dl)
+
+    # Dataset TRAIN (UNIQUEMENT pour le retrieval)
+    train_ds = PreprocessedGraphTextDataset("data/train_graphs.pkl")
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=32,
+        shuffle=False,          # IMPORTANT : pas besoin de shuffle
+        collate_fn=collate_graph_text,
+    )
+
+    retriever = RetrievalIndex(clip, tokenizer, device)
+    retriever.build(train_dl)
 
     # --------------------------------------------------------
     # Dataset test
@@ -371,3 +404,7 @@ def run_inference(cfg: InferenceConfig):
             writer.writerow(row)
 
     print("[Inference] Done. Submission file ready.")
+
+if __name__ == "__main__":
+    cfg = InferenceConfig()
+    run_inference(cfg)
