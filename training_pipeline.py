@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 training_pipeline.py
 ====================
@@ -82,7 +83,6 @@ ANTI-CHOIX GÉNÉRAUX :
    → fort risque d'effondrement
 """
 
-from __future__ import annotations
 
 import os
 import random
@@ -92,6 +92,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import glob
 
 from transformers import T5TokenizerFast
 
@@ -183,21 +184,34 @@ class Config:
     # --------------------
     # Stage 1 (contrastive)
     # --------------------
-    stage1_epochs: int = 3
+    stage1_epochs: int = 5
     stage1_lr: float = 2e-4
 
     # --------------------
     # Stage 2 (generation)
     # --------------------
-    stage2_epochs: int = 3
+    stage2_epochs: int = 5
     stage2_lr: float = 5e-5
     freeze_warmup_epochs: int = 1
+
+    # --------------------
+    # Adaptive LR (Stage 2)
+    # --------------------
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 2
+    min_lr: float = 1e-6
 
     # --------------------
     # DataLoader
     # --------------------
     batch_size: int = 16
     num_workers: int = 0
+
+    # --------------------
+    # Checkpointing
+    # --------------------
+    stage2_ckpt_dir: str = "checkpoints_stage2"
+    resume_stage2: bool = True
 
 """
 ANTI-CHOIX :
@@ -216,6 +230,85 @@ FIXED_PROMPT = (
     "reflects the structure and roles of the given molecule.\n"
     "Description:\n"
 )
+
+def infer_vocab_sizes_from_dataset(dataset):
+    """
+    Infère les tailles de vocabulaire des features catégorielles
+    sur L'ENSEMBLE du dataset, de manière ROBUSTE.
+
+    Gère correctement :
+    - graphes sans arêtes
+    - dataset[i] = (graph, description, idx)
+    """
+    max_node = None
+    max_edge = None
+
+    for i in range(len(dataset)):
+        g, _, _ = dataset[i]
+
+        # --------
+        # Nodes
+        # --------
+        x = g.x
+        node_max = x.max(dim=0).values
+
+        if max_node is None:
+            max_node = node_max
+        else:
+            max_node = torch.max(max_node, node_max)
+
+        # --------
+        # Edges (attention : peut être vide)
+        # --------
+        if g.edge_attr is not None and g.edge_attr.size(0) > 0:
+            e = g.edge_attr
+            edge_max = e.max(dim=0).values
+
+            if max_edge is None:
+                max_edge = edge_max
+            else:
+                max_edge = torch.max(max_edge, edge_max)
+
+    # Finalisation
+    node_vocab_sizes = (max_node + 1).long().tolist()
+
+    if max_edge is None:
+        # Cas pathologique mais possible : AUCUNE arête dans tout le dataset
+        raise RuntimeError("Dataset contains no edges at all.")
+
+    edge_vocab_sizes = (max_edge + 1).long().tolist()
+
+    return node_vocab_sizes, edge_vocab_sizes
+
+def load_stage1_clip(cfg):
+    device = cfg.device
+
+    tokenizer = T5TokenizerFast.from_pretrained(cfg.t5_name)
+
+    graph_encoder = MPNNEncoder(
+        node_vocab_sizes=cfg.node_vocab_sizes,
+        edge_vocab_sizes=cfg.edge_vocab_sizes,
+        hidden_dim=cfg.hidden_graph,
+    ).to(device)
+
+    text_encoder = FrozenT5TextEncoder(cfg.t5_name, freeze=True)
+
+    clip = GraphTextCLIP(
+        graph_encoder=graph_encoder,
+        text_encoder=text_encoder,
+        graph_dim=cfg.hidden_graph,
+        text_dim=768,
+    ).to(device)
+
+    ckpt = torch.load(cfg.stage1_path, map_location=device)
+    clip.graph_encoder.load_state_dict(ckpt["graph_encoder"])
+    clip.graph_proj.load_state_dict(ckpt["graph_proj"])
+    clip.text_proj.load_state_dict(ckpt["text_proj"])
+
+    clip.eval()
+
+    return clip, tokenizer
+
 
 def set_requires_grad(module: torch.nn.Module, value: bool):
     """
@@ -506,8 +599,24 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
     print("\n" + "=" * 70)
     print("STAGE 2: Retrieval-Augmented Generation (rewrite)")
     print("=" * 70)
-
+    os.makedirs(cfg.stage2_ckpt_dir, exist_ok=True)
     device = cfg.device
+
+    start_epoch = 0
+
+    if cfg.resume_stage2:
+        ckpts = sorted(
+            glob.glob(os.path.join(cfg.stage2_ckpt_dir, "stage2_epoch_*.pt"))
+        )
+        if len(ckpts) > 0:
+            latest_ckpt = ckpts[-1]
+            print(f"[Stage2] Resuming from {latest_ckpt}")
+
+            ckpt = torch.load(latest_ckpt, map_location=device)
+            generator.load_state_dict(ckpt["generator"])
+            opt.load_state_dict(ckpt["optimizer"])
+            start_epoch = ckpt["epoch"]
+
 
     # --------------------------------------------------------
     # Construction de l'index de retrieval
@@ -524,7 +633,7 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
     """
     clip.eval()
     retriever = RetrievalIndex(clip, tokenizer, device)
-
+    retriever.build(train_dl)
     # --------------------------------------------------------
     # Générateur : T5 + Soft Prompt + LoRA
     # --------------------------------------------------------
@@ -581,10 +690,11 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
     # Boucle d'entraînement
     # --------------------------------------------------------
     generator.train()
-
-    for ep in range(cfg.stage2_epochs):
+    best_loss = float("inf")
+    for ep in range(start_epoch, cfg.stage2_epochs):
         print(f"\n[Stage2] epoch {ep+1}/{cfg.stage2_epochs}")
-
+        epoch_loss = 0.0
+        num_batches = 0
         # ----------------------------------------------------
         # Dégel progressif
         # ----------------------------------------------------
@@ -598,10 +708,20 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
             set_requires_grad(clip.graph_proj, True)
 
             opt = torch.optim.AdamW(
-                list(generator.parameters())
-                + list(clip.graph_encoder.parameters())
-                + list(clip.graph_proj.parameters()),
-                lr=cfg.stage2_lr * 0.5,
+                [
+                    {"params": generator.parameters(), "lr": cfg.stage2_lr},
+                    {"params": clip.graph_encoder.parameters(), "lr": cfg.stage2_lr * 0.2},
+                    {"params": clip.graph_proj.parameters(), "lr": cfg.stage2_lr * 0.2},
+                ]
+            )
+
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt,
+                mode="min",
+                factor=cfg.scheduler_factor,
+                patience=cfg.scheduler_patience,
+                min_lr=cfg.min_lr,
+                verbose=True,
             )
 
         pbar = tqdm(train_dl, desc=f"[Stage2] epoch {ep+1}")
@@ -668,13 +788,40 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
             )
 
             loss = out.loss
-
+            epoch_loss += loss.item()
+            num_batches += 1
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
+        avg_epoch_loss = epoch_loss / max(1, num_batches)
+        if ep >= cfg.freeze_warmup_epochs:
+            scheduler.step(avg_epoch_loss)
+        print(f"[Stage2] epoch {ep+1} avg loss: {avg_epoch_loss:.4f}")
+        ckpt_path = os.path.join(
+            cfg.stage2_ckpt_dir,
+            f"stage2_epoch_{ep+1}.pt"
+        )
+
+        torch.save(
+            {
+                "epoch": ep + 1,
+                "generator": generator.state_dict(),
+                "optimizer": opt.state_dict(),
+                "avg_loss": avg_epoch_loss,
+            },
+            ckpt_path,
+        )
+
+        print(f"[Stage2] Saved checkpoint: {ckpt_path}")
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            torch.save(
+                generator.state_dict(),
+                "best_generator.pt"
+            )
     # --------------------------------------------------------
     # Sauvegarde Stage 2
     # --------------------------------------------------------
@@ -687,6 +834,7 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
         cfg.stage2_path,
     )
     print(f"[Stage2] Saved weights -> {cfg.stage2_path}")
+    
 
     return generator
 
@@ -730,9 +878,24 @@ def main():
     )
 
     # --------------------------------------------------------
+    # Inférer les tailles de vocabulaire (UNE FOIS)
+    # --------------------------------------------------------
+    node_vocab_sizes, edge_vocab_sizes = infer_vocab_sizes_from_dataset(train_ds)
+
+    cfg.node_vocab_sizes = node_vocab_sizes
+    cfg.edge_vocab_sizes = edge_vocab_sizes
+    print("Node vocab sizes:", node_vocab_sizes)
+    print("Edge vocab sizes:", edge_vocab_sizes)
+    # --------------------------------------------------------
     # STAGE 1
     # --------------------------------------------------------
-    clip, tokenizer = train_stage1_clip(train_dl, cfg)
+    if os.path.exists(cfg.stage1_path):
+        print("[Main] Found pretrained Stage 1 weights. Skipping Stage 1.")
+
+        clip, tokenizer = load_stage1_clip(cfg)
+    else:
+        clip, tokenizer = train_stage1_clip(train_dl, cfg)
+
 
     # --------------------------------------------------------
     # STAGE 2
@@ -740,3 +903,6 @@ def main():
     train_stage2_t5(train_dl, clip, tokenizer, cfg)
 
     print("\nTraining completed successfully.")
+
+if __name__ == "__main__":
+    main()

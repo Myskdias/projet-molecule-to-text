@@ -200,7 +200,8 @@ class RetrievalIndex:
             g = self.clip.encode_graph(batch_graph)  # [B, D], normalisé
 
             # Similarité cosinus = produit scalaire
-            sims = g @ self.text_embs.t()             # [B, N]
+            text_embs = self.text_embs.to(g.device)
+            sims = g @ text_embs.t()             # [B, N]
 
             # ------------------------------------------------
             # Gestion du self-retrieval leak (CRUCIAL)
