@@ -161,6 +161,12 @@ class InferenceConfig:
     temperature: float = 1.0
 
     # --------------------
+    # Vocab size
+    # --------------------
+    node_vocab_sizes = [86, 3, 7, 10, 5, 5, 7, 2, 2]
+    edge_vocab_sizes = [13, 4, 2]
+
+    # --------------------
     # Hardware
     # --------------------
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -221,26 +227,9 @@ def run_inference(cfg: InferenceConfig):
     => résultats invalides
     """
 
-    # --------------------------------------------------------
-# Inférer dynamiquement les tailles de vocabulaire
-# --------------------------------------------------------
-    dummy_graph = PreprocessedGraphTextDataset(
-        "data/train_graphs.pkl"
-    )[0][0]  # graph only
-
-    node_vocab_sizes = [
-        int(dummy_graph.x[:, i].max().item() + 1)
-        for i in range(dummy_graph.x.size(1))
-    ]
-
-    edge_vocab_sizes = [
-        int(dummy_graph.edge_attr[:, i].max().item() + 1)
-        for i in range(dummy_graph.edge_attr.size(1))
-    ]
-
     graph_encoder = MPNNEncoder(
-        node_vocab_sizes=node_vocab_sizes,
-        edge_vocab_sizes=edge_vocab_sizes,
+        node_vocab_sizes=cfg.node_vocab_sizes,
+        edge_vocab_sizes=cfg.edge_vocab_sizes,
         hidden_dim=cfg.hidden_graph,
     ).to(device)
     text_encoder = FrozenT5TextEncoder(cfg.t5_name, freeze=True)
@@ -252,27 +241,38 @@ def run_inference(cfg: InferenceConfig):
         text_dim=768,
     ).to(device)
 
-    # Chargement poids Stage 1
-    ckpt1 = torch.load(cfg.stage1_path, map_location=device)
-    clip.graph_encoder.load_state_dict(ckpt1["graph_encoder"])
-    clip.graph_proj.load_state_dict(ckpt1["graph_proj"])
-    clip.text_proj.load_state_dict(ckpt1["text_proj"])
+    # Chargement checkpoint Stage 2 (choisi pour Kaggle)
+    ckpt2 = torch.load(cfg.stage2_path, map_location=device)
 
-    clip.eval()
+    # 1) Générateur T5 (LoRA + soft prompt)
 
     # --------------------------------------------------------
-    # Chargement du générateur (Stage 2)
+    # Chargement du générateur
     # --------------------------------------------------------
     generator = GraphSoftPromptT5(
         model_name=cfg.t5_name,
         graph_emb_dim=cfg.hidden_graph,
         prompt_len=cfg.prompt_len,
     ).to(device)
-
-    ckpt2 = torch.load(cfg.stage2_path, map_location=device)
     generator.load_state_dict(ckpt2["generator"])
     generator.eval()
 
+    # 2) Encodeur graphe affiné en Stage 2 (si présent)
+    if "graph_encoder" in ckpt2:
+        clip.graph_encoder.load_state_dict(ckpt2["graph_encoder"])
+    if "graph_proj" in ckpt2:
+        clip.graph_proj.load_state_dict(ckpt2["graph_proj"])
+
+    # 3) Fallback sécurité : Stage 1 seulement si nécessaire
+    elif os.path.exists(cfg.stage1_path):
+        print("Fallback, loading stage 1 checkpoint")
+        ckpt1 = torch.load(cfg.stage1_path, map_location=device)
+        clip.graph_encoder.load_state_dict(ckpt1["graph_encoder"])
+        clip.graph_proj.load_state_dict(ckpt1["graph_proj"])
+        clip.text_proj.load_state_dict(ckpt1["text_proj"])
+
+    clip.eval()
+    print("Loaded Stage 2 checkpoint:", cfg.stage2_path)
     # --------------------------------------------------------
     # Construction de l'index de retrieval
     # --------------------------------------------------------
@@ -354,7 +354,7 @@ def run_inference(cfg: InferenceConfig):
         # ----------------------------------------------------
         # Encodage graphe → soft prompt
         # ----------------------------------------------------
-        graph_emb, _ = clip.graph_encoder(batch_graph)
+        graph_emb = graph_emb, _ = clip.graph_encoder(batch_graph)
 
         # ----------------------------------------------------
         # Génération

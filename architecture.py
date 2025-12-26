@@ -684,7 +684,10 @@ class GraphSoftPromptT5(nn.Module):
             target_modules=list(target_modules),
         )
         self.t5 = get_peft_model(self.t5, lora_cfg)
-
+        # Sécurité: s'assurer que seul LoRA est entraînable dans le backbone
+        for name, p in self.t5.named_parameters():
+            if "lora_" not in name:
+                p.requires_grad = False
         d_model = self.t5.config.d_model
 
         # ====================================================

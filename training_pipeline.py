@@ -603,19 +603,22 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
     device = cfg.device
 
     start_epoch = 0
+    best_loss = float("inf")
 
     if cfg.resume_stage2:
-        ckpts = sorted(
-            glob.glob(os.path.join(cfg.stage2_ckpt_dir, "stage2_epoch_*.pt"))
-        )
+        ckpts = sorted(glob.glob(os.path.join(cfg.stage2_ckpt_dir, "stage2_epoch_*.pt")))
         if len(ckpts) > 0:
             latest_ckpt = ckpts[-1]
             print(f"[Stage2] Resuming from {latest_ckpt}")
-
             ckpt = torch.load(latest_ckpt, map_location=device)
             generator.load_state_dict(ckpt["generator"])
             opt.load_state_dict(ckpt["optimizer"])
             start_epoch = ckpt["epoch"]
+            best_loss = ckpt.get("best_loss", best_loss)
+            if "graph_encoder" in ckpt:
+                clip.graph_encoder.load_state_dict(ckpt["graph_encoder"])
+            if "graph_proj" in ckpt:
+                clip.graph_proj.load_state_dict(ckpt["graph_proj"])
 
 
     # --------------------------------------------------------
@@ -679,10 +682,10 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
     """
     set_requires_grad(clip.graph_encoder, False)
     set_requires_grad(clip.graph_proj, False)
-    set_requires_grad(generator, True)
-
+    # IMPORTANT : on ne touche pas aux requires_grad du générateur,
+    # on laisse PEFT décider (LoRA + soft prompt uniquement).
     opt = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, generator.parameters()),
+        [p for p in generator.parameters() if p.requires_grad],
         lr=cfg.stage2_lr,
     )
 
@@ -690,7 +693,11 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
     # Boucle d'entraînement
     # --------------------------------------------------------
     generator.train()
-    best_loss = float("inf")
+
+    print(
+        "text_proj requires_grad:",
+        any(p.requires_grad for p in clip.text_proj.parameters())
+    )
     for ep in range(start_epoch, cfg.stage2_epochs):
         print(f"\n[Stage2] epoch {ep+1}/{cfg.stage2_epochs}")
         epoch_loss = 0.0
@@ -706,7 +713,8 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
             """
             set_requires_grad(clip.graph_encoder, True)
             set_requires_grad(clip.graph_proj, True)
-
+            clip.graph_encoder.train()
+            clip.graph_proj.train()
             opt = torch.optim.AdamW(
                 [
                     {"params": generator.parameters(), "lr": cfg.stage2_lr},
@@ -807,10 +815,15 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
 
         torch.save(
             {
-                "epoch": ep + 1,
-                "generator": generator.state_dict(),
-                "optimizer": opt.state_dict(),
-                "avg_loss": avg_epoch_loss,
+            "epoch": ep + 1,
+            "generator": generator.state_dict(),
+            "optimizer": opt.state_dict(),
+            "avg_loss": avg_epoch_loss,
+            "best_loss": best_loss,
+
+            # IMPORTANT: si tu dégèles le graphe en Stage2
+            "graph_encoder": clip.graph_encoder.state_dict(),
+            "graph_proj": clip.graph_proj.state_dict(),
             },
             ckpt_path,
         )
