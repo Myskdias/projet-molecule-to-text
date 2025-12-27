@@ -7,7 +7,9 @@ from typing import List
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import pandas as pd
 
+from reranker import rerank_topk_hybrid
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
 from retrieval.retrieval import RetrievalIndex
 from retrieval.text_encoder import MiniLMTextEncoder
@@ -26,7 +28,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 VAL_GRAPHS = "data/validation_graphs.pkl"
-CLIP_WEIGHTS = "checkpoints/checkpoint_1_15.pt"
+CLIP_WEIGHTS = "weights_stage1_clip.pt"
 
 NODE_VOCAB = [200, 20]
 EDGE_VOCAB = [50, 20]
@@ -34,7 +36,7 @@ HIDDEN_GRAPH = 300
 
 INDEX_BATCH_SIZE = 32
 VAL_BATCH_SIZE = 32
-TOP_K = 5
+TOP_K = 10
 NEIGHBOR_RANK = 0  # top-1
 
 
@@ -124,21 +126,32 @@ def main():
     for batch_graph, _ in tqdm(dl_val, desc="Retrieval"):
         batch_graph = batch_graph.to(DEVICE)
 
-        nn_indices, _ = retriever.query(
+        nn_indices, scores = retriever.query(
             clip_model,
             batch_graph,
             k=TOP_K,
         )
 
-        chosen = nn_indices[:, NEIGHBOR_RANK]  # top-1
-
         val_graphs = batch_graph.to_data_list()
 
         for b in range(len(val_graphs)):
-            # Prediction (TRAIN)
-            train_idx = int(chosen[b].item())
-            train_graph = ds_train.graphs[train_idx]
-            pred_text = id2desc_train[train_graph.id]
+            # Top-k indices and scores for this graph
+            idx_b = nn_indices[b].tolist()    # [k]
+            scores_b = scores[b].tolist()     # [k]
+
+            # Candidate captions from TRAIN
+            captions_b = []
+            for train_idx in idx_b:
+                train_graph = ds_train.graphs[int(train_idx)]
+                captions_b.append(id2desc_train[train_graph.id])
+
+            #  RERANK HERE
+            pred_text = rerank_topk_hybrid(
+                captions=captions_b,
+                graph_scores=scores_b,
+                text_encoder=text_encoder,
+                alpha=0.7,
+            )
 
             # Reference (VAL)
             val_graph = val_graphs[b]
@@ -148,12 +161,12 @@ def main():
             refs.append(ref_text)
 
     print(f"[VAL EVAL] Collected {len(preds)} predictions.")
-
+    df = pd.DataFrame({"prediction": preds, "ground_truth": refs})
     # -----------------------------------------------------
     # Metrics
     # -----------------------------------------------------
     bleu4, bert_f1 = evaluate_all(preds, refs, device=DEVICE)
-
+    
     print("\n[VAL EVAL] Final metrics:")
     print(f"  BLEU-4: {bleu4:.4f}")
     print(f"  BERTScore F1: {bert_f1:.4f}")

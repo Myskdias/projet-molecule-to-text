@@ -21,7 +21,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 TEST_GRAPHS = "data/test_graphs.pkl"
-CLIP_WEIGHTS = "checkpoints/checkpoint_1_20.pt"
+CLIP_WEIGHTS = "weights_stage1_clip.pt"
 
 SUBMISSION_PATH = "submission.csv"
 
