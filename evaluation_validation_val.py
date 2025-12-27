@@ -7,6 +7,7 @@ from typing import List
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import pandas as pd
 
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
 from retrieval.retrieval import RetrievalIndex
@@ -26,7 +27,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 VAL_GRAPHS = "data/validation_graphs.pkl"
-CLIP_WEIGHTS = "checkpoints/checkpoint_1_15.pt"
+CLIP_WEIGHTS = "weights_stage2_clip.pt"
 
 NODE_VOCAB = [200, 20]
 EDGE_VOCAB = [50, 20]
@@ -149,6 +150,8 @@ def main():
             refs.append(ref_text)
 
     print(f"[VAL EVAL] Collected {len(preds)} predictions.")
+    df_res = pd.DataFrame(preds, refs)
+    df_res.to_csv("pred_v_res")
 
     # -----------------------------------------------------
     # Metrics

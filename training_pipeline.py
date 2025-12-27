@@ -26,7 +26,7 @@ HIDDEN_GRAPH = 300
 HIDDEN_TEXT = 256
 
 # Fichiers de sauvegarde
-CLIP_WEIGHTS = "weights_stage2_clip.pt"
+CLIP_WEIGHTS = "weights_stage1_clip.pt"
 CLIP_WEIGHTS_2 = "weights_stage2_clip.pt"
 
 # ==================================================================================
@@ -70,7 +70,7 @@ def train_stage_1_clip(train_dl, epochs=5):
             
             # Forward CLIP
             I_g, I_t = model(batch_graph, batch_text)
-            '''
+            
             # Loss Contrastive Symétrique
             logits = (model.logit_scale.exp()) * (I_g @ I_t.t())
             labels = torch.arange(I_g.size(0), device=DEVICE)
@@ -84,6 +84,7 @@ def train_stage_1_clip(train_dl, epochs=5):
             # cosine similarity matrix
             sim_matrix = I_g @ I_t.t()  
             loss = criterion(sim_matrix)
+            '''
             loss = loss + 0.1 * model.lp_loss + 0.01 * model.ent_loss
 
             loss.backward()
