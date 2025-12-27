@@ -184,7 +184,7 @@ class Config:
     # --------------------
     # Stage 1 (contrastive)
     # --------------------
-    stage1_epochs: int = 5
+    stage1_epochs: int = 7
     stage1_lr: float = 2e-4
 
     # --------------------
@@ -192,7 +192,7 @@ class Config:
     # --------------------
     stage2_epochs: int = 5
     stage2_lr: float = 5e-5
-    freeze_warmup_epochs: int = 1
+    freeze_warmup_epochs: int = 6
 
     # --------------------
     # Adaptive LR (Stage 2)
@@ -226,9 +226,18 @@ ANTI-CHOIX :
 """
 
 FIXED_PROMPT = (
-    "Rephrase the following molecular description so that it accurately "
-    "reflects the structure and roles of the given molecule.\n"
-    "Description:\n"
+    """You are given a candidate description of a molecule.
+
+Your task is to minimally edit the description so that it remains
+chemically correct and consistent with the molecular graph.
+
+IMPORTANT RULES:
+- Do NOT add new chemical groups, properties, or biological roles.
+- Do NOT invent functional groups or activities.
+- If information is uncertain, keep the original wording.
+- Prefer removing incorrect details over adding new ones.
+
+Description: {retrieved_desc}"""
 )
 
 def infer_vocab_sizes_from_dataset(dataset):
@@ -793,6 +802,7 @@ def train_stage2_t5(train_dl, clip: GraphTextCLIP, tokenizer, cfg: Config):
                 input_ids=tok_in["input_ids"],
                 attention_mask=tok_in["attention_mask"],
                 labels=tok_out["input_ids"],
+
             )
 
             loss = out.loss

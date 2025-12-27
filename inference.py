@@ -133,7 +133,7 @@ class InferenceConfig:
     # --------------------
     test_graphs: str = "data/test_graphs.pkl"
     stage1_path: str = "weights_stage1_clip.pt"
-    stage2_path: str = "weights_stage2_t5.pt"
+    stage2_path: str = "checkpoints_stage2\stage2_epoch_5.pt"
     submission_path: str = "submission.csv"
 
     # --------------------
@@ -146,8 +146,8 @@ class InferenceConfig:
     # --------------------
     # Tokenisation
     # --------------------
-    max_in_len: int = 256
-    max_out_len: int = 256
+    max_in_len: int = 128
+    max_out_len: int = 128
 
     # --------------------
     # Retrieval
@@ -157,8 +157,8 @@ class InferenceConfig:
     # --------------------
     # Generation
     # --------------------
-    num_beams: int = 4
-    temperature: float = 1.0
+    num_beams: int = 2
+    temperature: float = 0.7
 
     # --------------------
     # Vocab size
@@ -177,9 +177,18 @@ class InferenceConfig:
 # ============================================================
 
 FIXED_PROMPT = (
-    "Rephrase the following molecular description so that it accurately "
-    "reflects the structure and roles of the given molecule.\n"
-    "Description:\n"
+    """You are given a candidate description of a molecule.
+
+Your task is to minimally edit the description so that it remains
+chemically correct and consistent with the molecular graph.
+
+IMPORTANT RULES:
+- Do NOT add new chemical groups, properties, or biological roles.
+- Do NOT invent functional groups or activities.
+- If information is uncertain, keep the original wording.
+- Prefer removing incorrect details over adding new ones.
+
+Description: {retrieved_desc}"""
 )
 
 
@@ -213,7 +222,7 @@ def run_inference(cfg: InferenceConfig):
     # Tokenizer
     # --------------------------------------------------------
     tokenizer = T5TokenizerFast.from_pretrained(cfg.t5_name)
-
+    tokenizer.model_max_length = cfg.max_in_len
     # --------------------------------------------------------
     # Chargement des modèles (Stage 1)
     # --------------------------------------------------------
@@ -313,7 +322,7 @@ def run_inference(cfg: InferenceConfig):
     test_ds = PreprocessedGraphTestDataset(cfg.test_graphs)
     test_dl = DataLoader(
         test_ds,
-        batch_size=1,  # batch=1 pour simplicité & alignement IDs
+        batch_size=32,  # batch=1 pour simplicité & alignement IDs
         shuffle=False,
         collate_fn=collate_graph_only,
     )
@@ -340,7 +349,7 @@ def run_inference(cfg: InferenceConfig):
         # Construction input texte
         # ----------------------------------------------------
         inputs = [
-            FIXED_PROMPT + retrieved_descs[0]
+            FIXED_PROMPT + desc for desc in retrieved_descs
         ]
 
         tok_in = tokenizer(
@@ -354,7 +363,7 @@ def run_inference(cfg: InferenceConfig):
         # ----------------------------------------------------
         # Encodage graphe → soft prompt
         # ----------------------------------------------------
-        graph_emb = graph_emb, _ = clip.graph_encoder(batch_graph)
+        graph_emb, _ = clip.graph_encoder(batch_graph)
 
         # ----------------------------------------------------
         # Génération
@@ -365,20 +374,18 @@ def run_inference(cfg: InferenceConfig):
             attention_mask=tok_in["attention_mask"],
             max_length=cfg.max_out_len,
             num_beams=cfg.num_beams,
-            temperature=cfg.temperature,
+            temperature=cfg.temperature, #temp become useless
+            do_sample=False,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.2,
+            early_stopping=True
         )
 
-        text = tokenizer.decode(
-            gen_ids[0],
-            skip_special_tokens=True,
-        )
+        texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
-        predictions.append(
-            {
-                "ID": ids[0],
-                "description": text,
-            }
-        )
+        
+        for mol_id, text in zip(ids, texts):
+            predictions.append({"ID": mol_id, "description": text})
 
     # --------------------------------------------------------
     # Écriture du fichier submission.csv
