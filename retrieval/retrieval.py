@@ -1,65 +1,48 @@
 import torch
-import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
+
 
 class RetrievalIndex:
     """
-    Gestionnaire de la base de connaissances (Vector Database).
+    Vector database for graph embeddings (MiniLM-compatible).
+    Graph-only retrieval: no text or tokens involved.
     """
-    def __init__(self, device='cuda'):
+    def __init__(self, device="cuda"):
         self.device = device
-        self.database_embeddings = None # [N, Dim]
-        self.train_captions_tokens = [] # Liste de tenseurs [Seq_Len]
+        self.database_embeddings = None  # [N, D]
 
-    def build_index(self, encoder, dataloader, captions_tokens_list):
+    @torch.no_grad()
+    def build_index(self, encoder, dataloader):
         """
-        Construit l'index en passant tout le dataset dans l'encodeur.
-        Utilise l'encodeur (potentiellement pré-entraîné CLIP) pour vectoriser les graphes.
+        Build retrieval index from graph embeddings only.
         """
         encoder.eval()
         encoder.to(self.device)
-        self.train_captions_tokens = captions_tokens_list
-        embeddings_list = []
-        
+
+        all_embeddings = []
+
         print("Construction de l'Index Vectoriel...")
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Indexing"):
-                graph_batch = batch[0].to(self.device)
-                
-                # On récupère le vecteur global du graphe (sortie 1)
-                graph_emb = encoder.encode_graph(graph_batch)
-                
-                # Stockage CPU pour éviter OOM
-                embeddings_list.append(graph_emb.cpu())
-        
-        self.database_embeddings = torch.cat(embeddings_list, dim=0).to(self.device)
+        for batch_graph, _ in tqdm(dataloader, desc="Indexing"):
+            batch_graph = batch_graph.to(self.device)
+
+            graph_emb = encoder.encode_graph(batch_graph)  # [B, D]
+            all_embeddings.append(graph_emb.cpu())
+
+        self.database_embeddings = torch.cat(all_embeddings, dim=0).to(self.device)
         print(f"Index prêt. {self.database_embeddings.shape[0]} molécules indexées.")
 
+    @torch.no_grad()
     def query(self, encoder, query_batch, k=3):
         """
-        Recherche les k plus proches voisins pour un batch de requêtes.
+        Retrieve top-k nearest neighbors for query graphs.
         """
         encoder.eval()
-        with torch.no_grad():
-            query_batch = query_batch.to(self.device)
-            query_emb = encoder.encode_graph(query_batch)
-            
-            # Produit scalaire (Cosinus Similarity sur vecteurs normalisés)
-            # [Batch, Dim] @ [Dim, N] -> [Batch, N]
-            similarity = torch.mm(query_emb, self.database_embeddings.t())
-            
-            scores, indices = torch.topk(similarity, k=k, dim=1)
-            return indices, scores
+        query_batch = query_batch.to(self.device)
 
-    def get_retrieved_tokens(self, indices):
-        """
-        Renvoie les tokens des textes associés aux indices trouvés.
-        Gère le padding dynamique.
-        """
-        indices_cpu = indices.cpu().tolist()
-        batch_tokens = [self.train_captions_tokens[idx] for idx in indices_cpu]
-        
-        # Padding avec 0 (supposé PAD_IDX)
-        padded_tokens = pad_sequence(batch_tokens, batch_first=True, padding_value=0)
-        return padded_tokens.long()
+        query_emb = encoder.encode_graph(query_batch)  # [B, D]
+
+        # Cosine similarity (embeddings already normalized)
+        similarity = query_emb @ self.database_embeddings.t()  # [B, N]
+
+        scores, indices = torch.topk(similarity, k=k, dim=1)
+        return indices, scores

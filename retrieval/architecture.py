@@ -90,51 +90,34 @@ class DeepGINEEncoder(nn.Module):
         graph_emb = self.readout_proj(graph_emb)
         return graph_emb, x
 
-class TextEncoder(nn.Module):
-    """Encodeur de Texte (Utilisé pour CLIP et pour lire l'antisèche RAG)"""
-    def __init__(self, vocab_size, d_model, nhead=4, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-    def forward(self, src, src_key_padding_mask=None):
-        x = self.embedding(src)
-        x = self.pos_encoder(x)
-        return self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
-
 # ==========================================
 # 3. MODULE ÉTAPE 1 : CLIP (ALIGNEMENT)
 # ==========================================
 
 class GraphTextCLIP(nn.Module):
-    """Modèle pour l'étape 1 : Apprend à aligner Graphe et Texte"""
-    def __init__(self, graph_encoder, text_encoder, graph_dim, text_dim, shared_dim=256):
+    """
+    CLIP-like model for Graph ↔ Text retrieval
+    Text side = MiniLM only
+    """
+    def __init__(self, graph_encoder, graph_dim, text_encoder, shared_dim=384):
         super().__init__()
         self.graph_encoder = graph_encoder
-        self.text_encoder = text_encoder
+        self.text_encoder = text_encoder  # MiniLM
         self.graph_proj = nn.Linear(graph_dim, shared_dim)
-        self.text_proj = nn.Linear(text_dim, shared_dim)
-        self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052) # ln(100) ~ 4.6
+        self.logit_scale = nn.Parameter(torch.tensor(0.0))  # exp(0)=1
 
-    def forward(self, batch_graph, batch_text, text_mask):
-        # Encodage Graphe
+    def forward(self, batch_graph, batch_texts):
+        # Graph encoding
         graph_feat, _ = self.graph_encoder(batch_graph)
-        graph_emb = self.graph_proj(graph_feat)
-        
-        # Encodage Texte
-        text_seq = self.text_encoder(batch_text, src_key_padding_mask=text_mask)
-        # Pooling: On prend la moyenne des tokens non-padded (simplifié ici par mean global)
-        text_feat = text_seq.mean(dim=1) 
-        text_emb = self.text_proj(text_feat)
-        
-        # Normalisation L2 (Crucial pour CLIP)
-        return F.normalize(graph_emb, dim=1), F.normalize(text_emb, dim=1)
-    
+        graph_emb = F.normalize(self.graph_proj(graph_feat), dim=1)
+
+        # Text encoding (MiniLM)
+        text_emb = self.text_encoder(batch_texts)  # already normalized
+
+        return graph_emb, text_emb
+
     @torch.no_grad()
     def encode_graph(self, batch_graph):
         graph_feat, _ = self.graph_encoder(batch_graph)
-        graph_emb = self.graph_proj(graph_feat)
-        return F.normalize(graph_emb, dim=1)
-    
+        graph_emb = F.normalize(self.graph_proj(graph_feat), dim=1)
+        return graph_emb
