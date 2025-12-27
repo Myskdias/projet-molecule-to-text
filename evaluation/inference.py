@@ -6,9 +6,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from architecture import DeepGINEEncoder, GraphTextCLIP, TextEncoder, MolecularCaptionModel
-from retrieval import RetrievalIndex
-from data_utils import (
+from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP, TextEncoder, MolecularCaptionModel
+from retrieval.retrieval import RetrievalIndex
+from utils.data_utils import (
     load_id2emb,
     load_descriptions_from_graphs,
     PreprocessedGraphDataset,
@@ -41,50 +41,9 @@ INDEX_BATCH_SIZE = 32
 TOP_K = 5
 NEIGHBOR_RANK = 0  # 0 => meilleur voisin (en test il n'y a pas de leak)
 
-# Generation (optionnel)
-DO_GENERATE_WITH_DECODER = False  # True si tu as un mapping id->token pour décoder derrière
 MAX_GEN_LEN = 200
 BOS_IDX = 1
 EOS_IDX = 2
-
-
-# =========================
-# UTIL: génération greedy d'IDs (optionnel)
-# =========================
-@torch.no_grad()
-def greedy_generate_ids(model: MolecularCaptionModel, batch_graph, retrieved_ids, retrieved_mask,
-                        max_len: int = 200):
-    """
-    Renvoie une séquence d'IDs (pas de décodage texte ici).
-    model.forward attend: (batch_graph, retrieved_ids, retrieved_mask, target_ids, target_mask, target_padding_mask)
-    """
-    model.eval()
-    batch_graph = batch_graph.to(DEVICE)
-    retrieved_ids = retrieved_ids.to(DEVICE)
-    retrieved_mask = retrieved_mask.to(DEVICE)
-
-    generated = torch.tensor([[BOS_IDX]], device=DEVICE, dtype=torch.long)
-
-    for _ in range(max_len):
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(generated.size(1)).to(DEVICE)
-        tgt_pad_mask = (generated == PAD_IDX)
-
-        logits = model(
-            batch_graph,
-            retrieved_ids,
-            retrieved_mask,
-            generated,
-            tgt_mask,
-            tgt_pad_mask,
-        )  # [B, T, V]
-
-        next_token = logits[:, -1].argmax(dim=-1, keepdim=True)  # [B,1]
-        generated = torch.cat([generated, next_token], dim=1)
-
-        if next_token.item() == EOS_IDX:
-            break
-
-    return generated.squeeze(0)  # [T]
 
 
 def main():
@@ -126,21 +85,7 @@ def main():
     print("Loading model...")
     graph_encoder = DeepGINEEncoder(NODE_VOCAB, EDGE_VOCAB, HIDDEN_GRAPH)
     text_encoder = TextEncoder(vocab_size, HIDDEN_TEXT)  # signature: (vocab_size, d_model, ...)
-    '''
-    model = MolecularCaptionModel(
-        graph_encoder,
-        text_encoder,          # text_encoder_rag
-        vocab_size,
-        d_model=HIDDEN_TEXT,
-        graph_dim=HIDDEN_GRAPH
-    ).to(DEVICE)
 
-    
-    state = torch.load(FINAL_MODEL_WEIGHTS, map_location=DEVICE)
-    model.load_state_dict(state)
-    model.eval()
-    print("Model loaded.")
-    '''
     clip_model = GraphTextCLIP(
         graph_encoder,
         text_encoder,
@@ -207,21 +152,7 @@ def main():
         neighbor_idx = int(chosen.item())
         neighbor_id = train_ids[neighbor_idx]
         retrieved_caption = id2desc[neighbor_id]
-        '''
-        if DO_GENERATE_WITH_DECODER:
-            # Build retrieved tokens for RAG memory
-            retrieved_ids = retriever.get_retrieved_tokens(chosen).to(DEVICE)  # [1, L]
-            retrieved_ids = torch.clamp(retrieved_ids.long(), min=0, max=vocab_size - 1)
-            retrieved_mask = (retrieved_ids == PAD_IDX)
-
-            # Generate ids (NO text decoding available in this repo)
-            gen_ids = greedy_generate_ids(model, batch_graph, retrieved_ids, retrieved_mask, max_len=MAX_GEN_LEN)
-            # Fallback representation: join ids (NOT Kaggle-friendly)
-            caption_out = " ".join(map(str, gen_ids.tolist()))
-        else:
-            # Retrieval-only text output (Kaggle-friendly)
-            caption_out = retrieved_caption
-        '''
+        
         caption_out = retrieved_caption #retrieval only
         # test graphs store unique id attribute
         test_id = batch_graph.id[0]

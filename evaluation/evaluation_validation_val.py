@@ -5,15 +5,15 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from architecture import DeepGINEEncoder, GraphTextCLIP, TextEncoder  # v0.6
-from retrieval import RetrievalIndex
-from data_utils import (
+from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP, TextEncoder  # v0.6
+from retrieval.retrieval import RetrievalIndex
+from utils.data_utils import (
     load_id2emb,
     load_descriptions_from_graphs,
     PreprocessedGraphDataset,
     collate_fn,
 )
-from eval_metrics import evaluate_all
+from metrics.eval_metrics import evaluate_all
 
 
 # =========================

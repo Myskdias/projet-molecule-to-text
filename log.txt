@@ -1,0 +1,5 @@
+BLEU-4 = 0.3647
+BERTScore = 0.9239 avant diffpool
+
+BLEU-4: 0.3685
+BERTScore F1: 0.9244 après diffpool

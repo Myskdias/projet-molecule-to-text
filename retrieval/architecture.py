@@ -58,7 +58,10 @@ class DeepGINEEncoder(nn.Module):
         self.bond_encoder = BondEncoder(hidden_dim, num_edge_vocab)
         self.convs = nn.ModuleList()
         self.batch_norms = nn.ModuleList()
-
+        self.readout_proj = nn.Linear(
+            hidden_dim * num_layers,
+            hidden_dim
+        )
         for _ in range(num_layers):
             mlp = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim * 2),
@@ -72,7 +75,7 @@ class DeepGINEEncoder(nn.Module):
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         x = self.atom_encoder(x)
         edge_emb = self.bond_encoder(edge_attr)
-
+        xs = [] #Extremlmy important, necessary to do pooling
         for i in range(self.num_layers):
             identity = x
             x = self.convs[i](x, edge_index, edge_attr=edge_emb)
@@ -80,8 +83,11 @@ class DeepGINEEncoder(nn.Module):
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
             x = x + identity # Skip connection
-
-        graph_emb = global_add_pool(x, batch)
+            xs.append(x)
+        #graph_emb = global_add_pool(x, batch) #without pooling
+        pooled = [global_add_pool(h, batch) for h in xs]
+        graph_emb = torch.cat(pooled, dim=1)
+        graph_emb = self.readout_proj(graph_emb)
         return graph_emb, x
 
 class TextEncoder(nn.Module):
@@ -131,48 +137,4 @@ class GraphTextCLIP(nn.Module):
         graph_feat, _ = self.graph_encoder(batch_graph)
         graph_emb = self.graph_proj(graph_feat)
         return F.normalize(graph_emb, dim=1)
-
-# ==========================================
-# 4. MODULE ÉTAPE 2 : GÉNÉRATEUR RAG
-# ==========================================
-
-class MolecularCaptionModel(nn.Module):
-    """Modèle pour l'étape 2 : Génération assistée (RAG)"""
-    def __init__(self, graph_encoder, text_encoder_rag, vocab_size, d_model=256, graph_dim=300):
-        super().__init__()
-        self.graph_encoder = graph_encoder
-        # Note : On peut réutiliser le text_encoder de CLIP comme "lecteur d'antisèche"
-        self.retrieved_text_encoder = text_encoder_rag 
-        
-        self.graph_projector = nn.Linear(graph_dim, d_model)
-        
-        # Décodeur (L'écrivain)
-        self.tgt_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoder = PositionalEncoding(d_model)
-        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=4, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
-        self.fc_out = nn.Linear(d_model, vocab_size)
-
-    def forward(self, batch_graph, retrieved_ids, retrieved_mask, target_ids, target_mask, target_padding_mask):
-        # A. Traitement Graphe
-        _, graph_node_emb = self.graph_encoder(batch_graph)
-        graph_feats, graph_mask = to_dense_batch(graph_node_emb, batch_graph.batch)
-        graph_feats = self.graph_projector(graph_feats)
-        
-        # B. Traitement Antisèche (RAG)
-        retrieved_feats = self.retrieved_text_encoder(retrieved_ids, src_key_padding_mask=retrieved_mask)
-        
-        # C. Fusion (Concaténation)
-        memory = torch.cat([graph_feats, retrieved_feats], dim=1)
-        graph_padding_mask = ~graph_mask
-        memory_key_padding_mask = torch.cat([graph_padding_mask, retrieved_mask], dim=1)
-        
-        # D. Décodage
-        tgt_emb = self.pos_encoder(self.tgt_embedding(target_ids))
-        output = self.transformer_decoder(
-            tgt_emb, memory, 
-            tgt_mask=target_mask, 
-            tgt_key_padding_mask=target_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
-        )
-        return self.fc_out(output)
+    
