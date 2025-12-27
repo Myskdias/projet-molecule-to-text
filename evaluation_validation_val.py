@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from architecture import DeepGINEEncoder, TextEncoder  # v0.6
+from architecture import DeepGINEEncoder, GraphTextCLIP, TextEncoder  # v0.6
 from retrieval import RetrievalIndex
 from data_utils import (
     load_id2emb,
@@ -84,11 +84,23 @@ def main():
     graph_encoder = DeepGINEEncoder(NODE_VOCAB, EDGE_VOCAB, hidden_dim=HIDDEN_GRAPH).to(DEVICE)
     text_encoder = TextEncoder(vocab_size, HIDDEN_TEXT).to(DEVICE)
 
+    clip_model = GraphTextCLIP(
+        graph_encoder,
+        text_encoder,
+        HIDDEN_GRAPH,
+        HIDDEN_TEXT
+    ).to(DEVICE)
+
     ckpt = torch.load(CLIP_WEIGHTS, map_location=DEVICE)
-    graph_encoder.load_state_dict(ckpt["graph_encoder"])
-    text_encoder.load_state_dict(ckpt["text_encoder"])
-    graph_encoder.eval()
-    text_encoder.eval()
+
+    clip_model.graph_encoder.load_state_dict(ckpt["graph_encoder"])
+    clip_model.text_encoder.load_state_dict(ckpt["text_encoder"])
+    clip_model.graph_proj.load_state_dict(ckpt["graph_proj"])
+    clip_model.text_proj.load_state_dict(ckpt["text_proj"])
+    clip_model.logit_scale.data = ckpt["logit_scale"]
+    #graph_encoder.eval()
+    #text_encoder.eval()
+    clip_model.eval()
 
     # -------------------------
     # Build retrieval index from TRAIN (same as inference.py)
@@ -103,7 +115,7 @@ def main():
             captions_tokens.append(caps[i].clone().detach().cpu())
 
     retriever = RetrievalIndex(device=DEVICE)
-    retriever.build_index(graph_encoder, index_dl, captions_tokens)
+    retriever.build_index(clip_model, index_dl, captions_tokens)
 
     # Pour sortir du texte (pas des tokens), on map idx voisin -> train_id -> train_description
     id2desc_train = load_descriptions_from_graphs(TRAIN_GRAPHS)
@@ -126,7 +138,7 @@ def main():
     print("[v0.6 VAL EVAL] Running retrieval on validation...")
     for batch_graph in tqdm(dl_val, desc="VAL Retrieval"):
         # batch_graph is PyG Batch
-        nn_indices, _ = retriever.query(graph_encoder, batch_graph, k=TOP_K)  # [B, k]
+        nn_indices, _ = retriever.query(clip_model, batch_graph, k=TOP_K)  # [B, k]
         chosen = nn_indices[:, NEIGHBOR_RANK]  # [B]
 
         # Map each neighbor index -> train id -> train description

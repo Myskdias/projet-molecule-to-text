@@ -28,10 +28,7 @@ class RetrievalIndex:
                 graph_batch = batch[0].to(self.device)
                 
                 # On récupère le vecteur global du graphe (sortie 1)
-                graph_emb, _ = encoder(graph_batch)
-                
-                # Normalisation L2 (pour similarité cosinus)
-                graph_emb = F.normalize(graph_emb, p=2, dim=1)
+                graph_emb = encoder.encode_graph(graph_batch)
                 
                 # Stockage CPU pour éviter OOM
                 embeddings_list.append(graph_emb.cpu())
@@ -46,8 +43,7 @@ class RetrievalIndex:
         encoder.eval()
         with torch.no_grad():
             query_batch = query_batch.to(self.device)
-            query_emb, _ = encoder(query_batch)
-            query_emb = F.normalize(query_emb, p=2, dim=1)
+            query_emb = encoder.encode_graph(query_batch)
             
             # Produit scalaire (Cosinus Similarity sur vecteurs normalisés)
             # [Batch, Dim] @ [Dim, N] -> [Batch, N]

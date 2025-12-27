@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from architecture import DeepGINEEncoder, TextEncoder, MolecularCaptionModel
+from architecture import DeepGINEEncoder, GraphTextCLIP, TextEncoder, MolecularCaptionModel
 from retrieval import RetrievalIndex
 from data_utils import (
     load_id2emb,
@@ -24,6 +24,8 @@ TRAIN_GRAPHS = "data/train_graphs.pkl"
 TEST_GRAPHS = "data/test_graphs.pkl"
 TRAIN_EMB_CSV = "data/train_embeddings.csv"
 
+# Poids Stage1 CLIP de ta v0.6 (contient graph_encoder + text_encoder)
+CLIP_WEIGHTS = "weights_stage1_clip.pt"
 FINAL_MODEL_WEIGHTS = "weights_stage2_final.pt"
 SUBMISSION_PATH = "submission.csv"
 
@@ -124,6 +126,7 @@ def main():
     print("Loading model...")
     graph_encoder = DeepGINEEncoder(NODE_VOCAB, EDGE_VOCAB, HIDDEN_GRAPH)
     text_encoder = TextEncoder(vocab_size, HIDDEN_TEXT)  # signature: (vocab_size, d_model, ...)
+    '''
     model = MolecularCaptionModel(
         graph_encoder,
         text_encoder,          # text_encoder_rag
@@ -132,11 +135,29 @@ def main():
         graph_dim=HIDDEN_GRAPH
     ).to(DEVICE)
 
+    
     state = torch.load(FINAL_MODEL_WEIGHTS, map_location=DEVICE)
     model.load_state_dict(state)
     model.eval()
     print("Model loaded.")
+    '''
+    clip_model = GraphTextCLIP(
+        graph_encoder,
+        text_encoder,
+        HIDDEN_GRAPH,
+        HIDDEN_TEXT
+    ).to(DEVICE)
 
+    ckpt = torch.load(CLIP_WEIGHTS, map_location=DEVICE)
+
+    clip_model.graph_encoder.load_state_dict(ckpt["graph_encoder"])
+    clip_model.text_encoder.load_state_dict(ckpt["text_encoder"])
+    clip_model.graph_proj.load_state_dict(ckpt["graph_proj"])
+    clip_model.text_proj.load_state_dict(ckpt["text_proj"])
+    clip_model.logit_scale.data = ckpt["logit_scale"]
+    #graph_encoder.eval()
+    #text_encoder.eval()
+    clip_model.eval()
     # =========================
     # Build retrieval index from TRAIN (same as stage2)
     # captions_tokens = list of tensors [seq_len] (CPU)
@@ -153,7 +174,7 @@ def main():
     retriever = RetrievalIndex(device=DEVICE)
     # IMPORTANT: build_index attend "for batch in dataloader: graph_batch = batch[0]"
     # => on lui passe un dataloader qui yield (batch_graph, caps)
-    retriever.build_index(model.graph_encoder, index_dl, captions_tokens)
+    retriever.build_index(clip_model, index_dl, captions_tokens)
 
     # =========================
     # Load train descriptions for retrieval-only submission
@@ -179,14 +200,14 @@ def main():
 
     for batch_graph in tqdm(dl_test, desc="Infer"):
         # batch_graph is a PyG Batch (batch_size=1)
-        nn_indices, _ = retriever.query(model.graph_encoder, batch_graph, k=TOP_K)  # [1,k]
+        nn_indices, _ = retriever.query(clip_model, batch_graph, k=TOP_K)  # [1,k]
         chosen = nn_indices[:, NEIGHBOR_RANK]  # [1]
 
         # Map neighbor index -> train id -> description
         neighbor_idx = int(chosen.item())
         neighbor_id = train_ids[neighbor_idx]
         retrieved_caption = id2desc[neighbor_id]
-
+        '''
         if DO_GENERATE_WITH_DECODER:
             # Build retrieved tokens for RAG memory
             retrieved_ids = retriever.get_retrieved_tokens(chosen).to(DEVICE)  # [1, L]
@@ -200,7 +221,8 @@ def main():
         else:
             # Retrieval-only text output (Kaggle-friendly)
             caption_out = retrieved_caption
-
+        '''
+        caption_out = retrieved_caption #retrieval only
         # test graphs store unique id attribute
         test_id = batch_graph.id[0]
         rows.append([test_id, caption_out])

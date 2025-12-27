@@ -50,7 +50,7 @@ class BondEncoder(nn.Module):
 
 class DeepGINEEncoder(nn.Module):
     """Encodeur de Graphe (L'Oeil du modèle)"""
-    def __init__(self, num_node_vocab, num_edge_vocab, hidden_dim=300, num_layers=5, dropout=0.5):
+    def __init__(self, num_node_vocab, num_edge_vocab, hidden_dim=300, num_layers=5, dropout=0.1):#old drop out 0.5
         super().__init__()
         self.num_layers = num_layers
         self.dropout = dropout
@@ -125,6 +125,12 @@ class GraphTextCLIP(nn.Module):
         
         # Normalisation L2 (Crucial pour CLIP)
         return F.normalize(graph_emb, dim=1), F.normalize(text_emb, dim=1)
+    
+    @torch.no_grad()
+    def encode_graph(self, batch_graph):
+        graph_feat, _ = self.graph_encoder(batch_graph)
+        graph_emb = self.graph_proj(graph_feat)
+        return F.normalize(graph_emb, dim=1)
 
 # ==========================================
 # 4. MODULE ÉTAPE 2 : GÉNÉRATEUR RAG

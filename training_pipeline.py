@@ -77,11 +77,14 @@ def train_stage_1_clip(train_dl, vocab_size, epochs=5):
     # Sauvegarde des encodeurs pré-entraînés
     torch.save({
         'graph_encoder': model.graph_encoder.state_dict(),
-        'text_encoder': model.text_encoder.state_dict()
+        'text_encoder': model.text_encoder.state_dict(),
+        'graph_proj': model.graph_proj.state_dict(),
+        'text_proj': model.text_proj.state_dict(),
+        'logit_scale': model.logit_scale.data
     }, CLIP_WEIGHTS)
     print(f"Étape 1 terminée. Poids sauvegardés dans {CLIP_WEIGHTS}")
     
-    return model.graph_encoder, model.text_encoder
+    return model #model.graph_encoder, model.text_encoder
 
 # ==================================================================================
 # ÉTAPE 2 : GÉNÉRATION RAG (End-to-End avec Decoder)
