@@ -8,6 +8,7 @@ from tqdm import tqdm
 import gc
 
 # Import de NOS fichiers
+from metrics.circle_loss import CircleLoss
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
 from retrieval.retrieval import RetrievalIndex
 from retrieval.text_encoder import MiniLMTextEncoder
@@ -25,7 +26,8 @@ HIDDEN_GRAPH = 300
 HIDDEN_TEXT = 256
 
 # Fichiers de sauvegarde
-CLIP_WEIGHTS = "weights_stage1_clip.pt"
+CLIP_WEIGHTS = "weights_stage2_clip.pt"
+CLIP_WEIGHTS_2 = "weights_stage2_clip.pt"
 
 # ==================================================================================
 # ÉTAPE 1 : ALIGNEMENT CLIP (Contrastive Pre-training)
@@ -68,12 +70,22 @@ def train_stage_1_clip(train_dl, epochs=5):
             
             # Forward CLIP
             I_g, I_t = model(batch_graph, batch_text)
-            
+            '''
             # Loss Contrastive Symétrique
             logits = (model.logit_scale.exp()) * (I_g @ I_t.t())
             labels = torch.arange(I_g.size(0), device=DEVICE)
             loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)) / 2
-            
+            '''
+            criterion = CircleLoss(
+                gamma=32,
+                m_pos=0.25,
+                m_neg=0.25
+            )
+            # cosine similarity matrix
+            sim_matrix = I_g @ I_t.t()  
+            loss = criterion(sim_matrix)
+            loss = loss + 0.1 * model.lp_loss + 0.01 * model.ent_loss
+
             loss.backward()
             optimizer.step()
             
@@ -103,6 +115,105 @@ def train_stage_1_clip(train_dl, epochs=5):
     
     return model #model.graph_encoder, model.text_encoder
 
+def train_stage_2_clip(train_dl, epochs=5):
+    print("\n" + "="*50)
+    print("DEMARRAGE ETAPE 1 : ALIGNEMENT CLIP")
+    print("Objectif : Apprendre aux encodeurs à rapprocher Graphe et Texte")
+    print("="*50)
+
+    # 1. Instanciation des Encodeurs
+    graph_enc = DeepGINEEncoder(NODE_VOCAB, EDGE_VOCAB, HIDDEN_GRAPH)
+    text_enc = MiniLMTextEncoder(
+        device=DEVICE,
+        use_lora=True,
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+    )
+    text_enc.print_trainable_parameters()
+    checkpoint = torch.load(CLIP_WEIGHTS, map_location=DEVICE)
+    # Wrapper CLIP
+    model = GraphTextCLIP(
+        graph_encoder=graph_enc,
+        graph_dim=HIDDEN_GRAPH,
+        text_encoder=text_enc,
+        shared_dim=384
+    ).to(DEVICE)
+
+    model.graph_encoder.load_state_dict(checkpoint["graph_encoder"])
+    model.graph_proj.load_state_dict(checkpoint["graph_proj"])
+    model.logit_scale.data = checkpoint["logit_scale"]
+    optimizer = optim.AdamW(
+        [
+            {"params": model.graph_encoder.parameters(), "lr": 5e-5},
+            {"params": model.graph_proj.parameters(), "lr": 5e-5},
+            {"params": model.text_encoder.parameters(), "lr": 1e-6},  # LoRA
+            {"params": [model.logit_scale], "lr": 5e-5},
+        ],
+        weight_decay=5e-5
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=1e-6
+    )
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        num_batches = 0
+        pbar = tqdm(train_dl, desc=f"Epoch {epoch+1}/{epochs} [CLIP]")
+        
+        for batch in pbar:
+            batch_graph, batch_text = batch
+            batch_graph = batch_graph.to(DEVICE)
+            
+            optimizer.zero_grad()
+            
+            # Forward CLIP
+            I_g, I_t = model(batch_graph, batch_text)
+            
+            # Loss Contrastive Symétrique
+            logits = (model.logit_scale.exp()) * (I_g @ I_t.t())
+            labels = torch.arange(I_g.size(0), device=DEVICE)
+            loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)) / 2
+            '''
+            criterion = CircleLoss(
+                gamma=32,
+                m_pos=0.25,
+                m_neg=0.25
+            )
+            # cosine similarity matrix
+            sim_matrix = I_g @ I_t.t()  
+            loss = criterion(sim_matrix)
+            '''
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+        
+        print("Average loss: ", total_loss / num_batches)
+        scheduler.step()
+        print(f"LR: {scheduler.get_last_lr()[0]:.2e}")
+        if(epoch % 5 == 0 and not epoch == 0):
+            torch.save({
+                'graph_encoder': model.graph_encoder.state_dict(),
+                'text_encoder': model.text_encoder.state_dict(),
+                'graph_proj': model.graph_proj.state_dict(),
+                'logit_scale': model.logit_scale.data
+            }, f"checkpoints/checkpoint_2_{epoch}.pt")
+
+    # Sauvegarde des encodeurs pré-entraînés
+    torch.save({
+        'graph_encoder': model.graph_encoder.state_dict(),
+        'text_encoder': model.text_encoder.state_dict(),
+        'graph_proj': model.graph_proj.state_dict(),
+        'logit_scale': model.logit_scale.data
+    }, CLIP_WEIGHTS_2)
+    print(f"Étape 2 terminée. Poids sauvegardés dans {CLIP_WEIGHTS_2}")
+    
+    return model
 
 # ==================================================================================
 # MAIN
@@ -125,9 +236,9 @@ def main():
         shuffle=True,
         collate_fn=collate_fn
     )
-
+    train_stage_1_clip(train_dl, epochs=20)
     # Entraînement CLIP (retrieval only)
-    train_stage_1_clip(train_dl, epochs=25)
+    #train_stage_2_clip(train_dl, epochs=10)
 
 if __name__ == "__main__":
     main()

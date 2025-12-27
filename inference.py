@@ -21,7 +21,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 TEST_GRAPHS = "data/test_graphs.pkl"
-CLIP_WEIGHTS = "checkpoints/checkpoint_1_20.pt"
+CLIP_WEIGHTS = "checkpoints/checkpoint_2_5.pt"
 
 SUBMISSION_PATH = "submission.csv"
 
@@ -134,7 +134,7 @@ def main():
     print(f"[INFER] Writing {SUBMISSION_PATH}")
     with open(SUBMISSION_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "caption"])
+        writer.writerow(["ID", "description"])
         writer.writerows(rows)
 
     print("[INFER] Done. submission.csv ready.")

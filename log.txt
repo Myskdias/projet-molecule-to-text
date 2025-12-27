@@ -6,3 +6,8 @@ BERTScore F1: 0.9244 après diffpool
 
 BLEU-4: 0.3759
 BERTScore F1: 0.9258 avec mini LM
+
+  BLEU-4: 0.3777
+  BERTScore F1: 0.9261 avec LORA
+BLEU-4: 0.3789
+  BERTScore F1: 0.9263

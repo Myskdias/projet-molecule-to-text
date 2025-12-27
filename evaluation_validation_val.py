@@ -92,7 +92,7 @@ def main():
         hidden_dim=HIDDEN_GRAPH,
     ).to(DEVICE)
 
-    text_encoder = MiniLMTextEncoder(device=DEVICE)
+    text_encoder = MiniLMTextEncoder(device=DEVICE, use_lora=False)
 
     clip_model = GraphTextCLIP(
         graph_encoder=graph_encoder,
@@ -103,6 +103,7 @@ def main():
     checkpoint = torch.load(CLIP_WEIGHTS, map_location=DEVICE)
     clip_model.graph_encoder.load_state_dict(checkpoint["graph_encoder"])
     clip_model.graph_proj.load_state_dict(checkpoint["graph_proj"])
+    #clip_model.text_encoder.load_state_dict(checkpoint["text_encoder"])
     clip_model.logit_scale.data = checkpoint["logit_scale"]
 
     clip_model.eval()
