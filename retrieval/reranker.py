@@ -1,5 +1,7 @@
+from sacrebleu import CHRF
 import torch
 import torch.nn.functional as F
+
 
 @torch.no_grad()
 def rerank_topk_simple(captions, text_encoder):
@@ -69,3 +71,49 @@ def rerank_topk_with_graph(graph_emb, captions, text_encoder, alpha=0.7):
 
     score = alpha * graph_sim + (1 - alpha) * lexical_sim
     return captions[score.argmax().item()]
+
+chrf = CHRF(word_order=2)  # proche BLEU
+
+@torch.no_grad()
+def rerank_topk_mbr(captions):
+    """
+    captions: list[str] (top-k)
+    returns: best caption (str)
+    """
+
+    k = len(captions)
+    if k == 1:
+        return captions[0]
+
+    scores = []
+
+    for i in range(k):
+        c_i = captions[i]
+        total = 0.0
+
+        for j in range(k):
+            if i == j:
+                continue
+            c_j = captions[j]
+            total += chrf.sentence_score(c_i, [c_j]).score
+
+        scores.append(total / (k - 1))
+
+    best_idx = max(range(k), key=lambda i: scores[i])
+    return captions[best_idx]
+
+def rerank_topk_mbr_weighted(captions, graph_scores, beta=0.2):
+    k = len(captions)
+    scores = []
+
+    for i in range(k):
+        total = 0.0
+        for j in range(k):
+            if i != j:
+                total += chrf.sentence_score(captions[i], [captions[j]]).score
+
+        mbr_score = total / (k - 1)
+        final_score = (1 - beta) * mbr_score + beta * graph_scores[i]
+        scores.append(final_score)
+
+    return captions[max(range(k), key=lambda i: scores[i])]

@@ -9,7 +9,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
 
-from reranker import rerank_topk_hybrid
+from retrieval.cross_encoder.cross_encoder import GraphTextCrossEncoder
+from retrieval.reranker import rerank_topk_hybrid, rerank_topk_mbr, rerank_topk_mbr_weighted
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
 from retrieval.retrieval import RetrievalIndex
 from retrieval.text_encoder import MiniLMTextEncoder
@@ -28,7 +29,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 VAL_GRAPHS = "data/validation_graphs.pkl"
-CLIP_WEIGHTS = "weights_stage1_clip.pt"
+CLIP_WEIGHTS = "other/weights_stage1_clip.pt"
+CROSS_ENCODER_WEIGHTS = "other/weights_cross_encoder.pt"
 
 NODE_VOCAB = [200, 20]
 EDGE_VOCAB = [50, 20]
@@ -36,7 +38,7 @@ HIDDEN_GRAPH = 300
 
 INDEX_BATCH_SIZE = 32
 VAL_BATCH_SIZE = 32
-TOP_K = 10
+TOP_K = 5
 NEIGHBOR_RANK = 0  # top-1
 
 
@@ -109,6 +111,21 @@ def main():
 
     clip_model.eval()
 
+    # =========================================================
+    # Load Cross-Encoder
+    # =========================================================
+    ckpt = torch.load(CROSS_ENCODER_WEIGHTS, map_location=DEVICE)
+
+    cross_encoder = GraphTextCrossEncoder(
+        graph_dim=ckpt["graph_dim"],
+        text_dim=ckpt["text_dim"],
+    ).to(DEVICE)
+
+    cross_encoder.load_state_dict(ckpt["state_dict"])
+    cross_encoder.eval()
+
+    print("[VAL EVAL] Cross-encoder loaded.")
+
     # -----------------------------------------------------
     # Build retrieval index (TRAIN graphs)
     # -----------------------------------------------------
@@ -133,6 +150,8 @@ def main():
         )
 
         val_graphs = batch_graph.to_data_list()
+        with torch.no_grad():
+            graph_embs = clip_model.encode_graph(batch_graph)  # [B, D]
 
         for b in range(len(val_graphs)):
             # Top-k indices and scores for this graph
@@ -144,7 +163,8 @@ def main():
             for train_idx in idx_b:
                 train_graph = ds_train.graphs[int(train_idx)]
                 captions_b.append(id2desc_train[train_graph.id])
-
+            
+            
             #  RERANK HERE
             pred_text = rerank_topk_hybrid(
                 captions=captions_b,
@@ -152,7 +172,21 @@ def main():
                 text_encoder=text_encoder,
                 alpha=0.7,
             )
+            '''
+            # CROSS ENCODER HERE
+            with torch.no_grad():
+                # Graph embedding (1 seul graphe)
+                graph_emb = graph_embs[b]
 
+                ce_scores = []
+                text_embs = text_encoder(captions_b)  # [k, Dt]
+                for i in range(len(captions_b)):
+                    score = cross_encoder(graph_emb, text_embs[i])
+                    ce_scores.append(score.item())
+
+            best_idx = int(torch.tensor(ce_scores).argmax())
+            pred_text = captions_b[best_idx]
+            '''
             # Reference (VAL)
             val_graph = val_graphs[b]
             ref_text = id2desc_val[val_graph.id]
@@ -162,6 +196,7 @@ def main():
 
     print(f"[VAL EVAL] Collected {len(preds)} predictions.")
     df = pd.DataFrame({"prediction": preds, "ground_truth": refs})
+    df.to_csv("pred_v_reel.csv")
     # -----------------------------------------------------
     # Metrics
     # -----------------------------------------------------
