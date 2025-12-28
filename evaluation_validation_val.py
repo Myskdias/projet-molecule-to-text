@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
 
+from editor.text_editor import graph_consistency_fix
 from retrieval.cross_encoder.cross_encoder import GraphTextCrossEncoder
 from retrieval.reranker import rerank_topk_hybrid, rerank_topk_mbr, rerank_topk_mbr_weighted
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
@@ -172,6 +173,7 @@ def main():
                 text_encoder=text_encoder,
                 alpha=0.7,
             )
+            pred_text = graph_consistency_fix(pred_text, val_graphs[b])
             '''
             # CROSS ENCODER HERE
             with torch.no_grad():
