@@ -1,27 +1,12 @@
-from __future__ import annotations
-
-import os
-import pickle
-from typing import List
-
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-import pandas as pd
+import os
 
-from editor.text_editor import graph_consistency_fix
-from retrieval.cross_encoder.cross_encoder import GraphTextCrossEncoder
-from retrieval.reranker import rerank_topk_hybrid, rerank_topk_mbr, rerank_topk_mbr_weighted
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
+from retrieval.cross_encoder.cross_encoder import GraphTextCrossEncoder
 from retrieval.retrieval import RetrievalIndex
 from retrieval.text_encoder import MiniLMTextEncoder
-from utils.data_utils import (
-    PreprocessedGraphDataset,
-    collate_fn,
-    load_descriptions_from_graphs,
-)
-from metrics.eval_metrics import evaluate_all
-
+from utils.data_utils import PreprocessedGraphDataset, collate_fn, load_descriptions_from_graphs
 
 # =========================================================
 # CONFIG
@@ -39,16 +24,8 @@ HIDDEN_GRAPH = 300
 
 INDEX_BATCH_SIZE = 32
 VAL_BATCH_SIZE = 32
-TOP_K = 5
-NEIGHBOR_RANK = 0  # top-1
 
-
-# =========================================================
-# MAIN EVALUATION
-# =========================================================
-@torch.no_grad()
-def main():
-
+def build():
     # -----------------------------------------------------
     # Sanity checks
     # -----------------------------------------------------
@@ -112,6 +89,7 @@ def main():
 
     clip_model.eval()
 
+    '''
     # =========================================================
     # Load Cross-Encoder
     # =========================================================
@@ -126,7 +104,7 @@ def main():
     cross_encoder.eval()
 
     print("[VAL EVAL] Cross-encoder loaded.")
-
+    '''
     # -----------------------------------------------------
     # Build retrieval index (TRAIN graphs)
     # -----------------------------------------------------
@@ -134,84 +112,12 @@ def main():
     retriever = RetrievalIndex(device=DEVICE)
     retriever.build_index(clip_model, dl_train)
 
-    # -----------------------------------------------------
-    # Retrieval on VAL set
-    # -----------------------------------------------------
-    preds: List[str] = []
-    refs: List[str] = []
-
-    print("[VAL EVAL] Running retrieval...")
-    for batch_graph, _ in tqdm(dl_val, desc="Retrieval"):
-        batch_graph = batch_graph.to(DEVICE)
-
-        nn_indices, scores = retriever.query(
-            clip_model,
-            batch_graph,
-            k=TOP_K,
-        )
-
-        val_graphs = batch_graph.to_data_list()
-        with torch.no_grad():
-            graph_embs = clip_model.encode_graph(batch_graph)  # [B, D]
-
-        for b in range(len(val_graphs)):
-            # Top-k indices and scores for this graph
-            idx_b = nn_indices[b].tolist()    # [k]
-            scores_b = scores[b].tolist()     # [k]
-
-            # Candidate captions from TRAIN
-            captions_b = []
-            for train_idx in idx_b:
-                train_graph = ds_train.graphs[int(train_idx)]
-                captions_b.append(id2desc_train[train_graph.id])
-            
-            
-            #  RERANK HERE
-            pred_text = rerank_topk_hybrid(
-                captions=captions_b,
-                graph_scores=scores_b,
-                text_encoder=text_encoder,
-                alpha=0.7,
-            )
-            # NIVEAU 0
-            pred_text = graph_consistency_fix(pred_text, val_graphs[b])
-            '''
-            # CROSS ENCODER HERE
-            with torch.no_grad():
-                # Graph embedding (1 seul graphe)
-                graph_emb = graph_embs[b]
-
-                ce_scores = []
-                text_embs = text_encoder(captions_b)  # [k, Dt]
-                for i in range(len(captions_b)):
-                    score = cross_encoder(graph_emb, text_embs[i])
-                    ce_scores.append(score.item())
-
-            best_idx = int(torch.tensor(ce_scores).argmax())
-            pred_text = captions_b[best_idx]
-            '''
-            # Reference (VAL)
-            val_graph = val_graphs[b]
-            ref_text = id2desc_val[val_graph.id]
-
-            preds.append(pred_text)
-            refs.append(ref_text)
-
-    print(f"[VAL EVAL] Collected {len(preds)} predictions.")
-    df = pd.DataFrame({"prediction": preds, "ground_truth": refs})
-    df.to_csv("pred_v_reel.csv")
-    # -----------------------------------------------------
-    # Metrics
-    # -----------------------------------------------------
-    bleu4, bert_f1 = evaluate_all(preds, refs, device=DEVICE)
-    
-    print("\n[VAL EVAL] Final metrics:")
-    print(f"  BLEU-4: {bleu4:.4f}")
-    print(f"  BERTScore F1: {bert_f1:.4f}")
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
-if __name__ == "__main__":
-    main()
+    return {"dl_train": dl_train,
+            "ds_train": ds_train,
+            "dl_val": dl_val,
+            "ds_val": ds_val,
+            "id2desc_train": id2desc_train,
+            "id2desc_val": id2desc_val,
+            "clip_model": clip_model,
+            "retriever": retriever
+            }
