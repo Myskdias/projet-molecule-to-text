@@ -10,7 +10,7 @@ from utils.utils import build
 
 TOP_K = 10
 SAVE_PATH = "weights/editor_level1_head.pt"
-
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def main():
 
@@ -29,6 +29,7 @@ def main():
         retriever=models["retriever"],
         text_encoder=models["clip_model"].text_encoder,
         top_k=TOP_K,
+        device=DEVICE
     )
     dataset = EditDataset(
         retrieved_texts=retrieved_texts,

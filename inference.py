@@ -4,7 +4,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from editor.text_editor import graph_consistency_fix
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
+from retrieval.reranker import rerank_topk_hybrid
 from retrieval.retrieval import RetrievalIndex
 from retrieval.text_encoder import MiniLMTextEncoder
 from utils.data_utils import (
@@ -21,7 +23,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 TEST_GRAPHS = "data/test_graphs.pkl"
-CLIP_WEIGHTS = "weights_stage1_clip.pt"
+CLIP_WEIGHTS = "other/weights_stage1_clip.pt"
 
 SUBMISSION_PATH = "submission.csv"
 
@@ -115,18 +117,43 @@ def main():
     for batch_graph in tqdm(dl_test, desc="Infer"):
         batch_graph = batch_graph.to(DEVICE)
 
-        nn_indices, _ = retriever.query(
+        nn_indices, scores = retriever.query(
             clip_model,
             batch_graph,
             k=TOP_K,
         )
+        val_graphs = batch_graph.to_data_list()
+        for b in range(len(val_graphs)):
+            # Top-k indices and scores for this graph
+            idx_b = nn_indices[b].tolist()    # [k]
+            scores_b = scores[b].tolist()     # [k]
 
+            # Candidate captions from TRAIN
+            captions_b = []
+            for train_idx in idx_b:
+                train_graph = ds_train.graphs[int(train_idx)]
+                captions_b.append(id2desc_train[train_graph.id])
+            
+            
+            #  RERANK HERE
+            pred_text = rerank_topk_hybrid(
+                captions=captions_b,
+                graph_scores=scores_b,
+                text_encoder=text_encoder,
+                alpha=0.7,
+            )
+            # NIVEAU 0
+            pred_text = graph_consistency_fix(pred_text, val_graphs[b])
+            val_graph = val_graphs[b]
+            rows.append([val_graph.id, pred_text])
+        '''
         train_idx = int(nn_indices[0, 0].item())
         train_graph = ds_train.graphs[train_idx]
         caption = id2desc_train[train_graph.id]
 
         test_graph = batch_graph.to_data_list()[0]
         rows.append([test_graph.id, caption])
+        '''
 
     # -------------------------
     # Write submission
@@ -134,7 +161,7 @@ def main():
     print(f"[INFER] Writing {SUBMISSION_PATH}")
     with open(SUBMISSION_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "caption"])
+        writer.writerow(["ID", "description"])
         writer.writerows(rows)
 
     print("[INFER] Done. submission.csv ready.")

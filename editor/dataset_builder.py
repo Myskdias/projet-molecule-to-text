@@ -12,6 +12,7 @@ def build_edit_text_pairs(
     retriever,
     text_encoder,
     top_k=10,
+    device='cuda'
 ):
     """
     Construit (retrieved_texts, gold_texts) pour le Niveau 1 editor.
@@ -26,7 +27,7 @@ def build_edit_text_pairs(
     print("[EDITOR DATASET] Building retrieved/gold pairs from TRAIN...")
 
     for batch_graph, _ in tqdm(dl_train, desc="Editor dataset"):
-        batch_graph = batch_graph.to(clip_model.device)
+        batch_graph = batch_graph.to(device)
         graphs = batch_graph.to_data_list()
 
         # Retrieval top-k

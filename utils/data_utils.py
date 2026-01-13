@@ -120,6 +120,18 @@ class PreprocessedGraphDataset(Dataset):
             return graph, text
         else:
             return graph
+        
+    @classmethod
+    def from_graphs(cls, graphs, mode: bool = False):
+        """
+        Build dataset directly from a list of preloaded graphs.
+        Useful for retrieval over TRAIN + VAL without reloading disk.
+        """
+        obj = cls.__new__(cls)   # bypass __init__
+        obj.graphs = graphs
+        obj.mode = mode
+        return obj
+
 
 
 

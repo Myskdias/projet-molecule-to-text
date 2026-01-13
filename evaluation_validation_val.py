@@ -8,8 +8,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
+from transformers import AutoTokenizer
 
 from editor.text_editor import graph_consistency_fix
+from editor.edit_model import EditModel
+from editor.utils import analyze_editability
 from retrieval.cross_encoder.cross_encoder import GraphTextCrossEncoder
 from retrieval.reranker import rerank_topk_hybrid, rerank_topk_mbr, rerank_topk_mbr_weighted
 from retrieval.architecture import DeepGINEEncoder, GraphTextCLIP
@@ -39,9 +42,10 @@ HIDDEN_GRAPH = 300
 
 INDEX_BATCH_SIZE = 32
 VAL_BATCH_SIZE = 32
-TOP_K = 5
+TOP_K = 1
 NEIGHBOR_RANK = 0  # top-1
 
+EDITOR_CKPT = "weights/editor_level1_head.pt"
 
 # =========================================================
 # MAIN EVALUATION
@@ -127,12 +131,43 @@ def main():
 
     print("[VAL EVAL] Cross-encoder loaded.")
 
+    # =======================================================
+    # Load Editor
+    # =======================================================
+    editor_model = EditModel("sentence-transformers/all-MiniLM-L6-v2").to(DEVICE)
+
+    ckpt = torch.load(EDITOR_CKPT, map_location=DEVICE)
+    editor_model.classifier.load_state_dict(ckpt["classifier"])
+    editor_model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(
+        "sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    # -----------------------------------------------------
+    # MERGE TRAIN + VAL FOR RETRIEVAL
+    # -----------------------------------------------------
+    print("[VAL EVAL] Merging TRAIN + VAL for retrieval index...")
+
+    ds_all = ds_train.graphs + ds_val.graphs
+    id2desc_all = {}
+    id2desc_all.update(id2desc_train)
+    id2desc_all.update(id2desc_val)
+
+    dl_all = DataLoader(
+        PreprocessedGraphDataset.from_graphs(ds_all, mode=True),
+        batch_size=INDEX_BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+
     # -----------------------------------------------------
     # Build retrieval index (TRAIN graphs)
     # -----------------------------------------------------
     print("[VAL EVAL] Building retrieval index...")
     retriever = RetrievalIndex(device=DEVICE)
+    #retriever.build_index(clip_model, dl_train)
     retriever.build_index(clip_model, dl_train)
+    #retriever.build_index(clip_model, dl_all)
 
     # -----------------------------------------------------
     # Retrieval on VAL set
@@ -162,6 +197,8 @@ def main():
             # Candidate captions from TRAIN
             captions_b = []
             for train_idx in idx_b:
+                #train_graph = ds_all[int(train_idx)] when using ds_all and dl_all
+                #captions_b.append(id2desc_all[train_graph.id])
                 train_graph = ds_train.graphs[int(train_idx)]
                 captions_b.append(id2desc_train[train_graph.id])
             
@@ -173,6 +210,19 @@ def main():
                 text_encoder=text_encoder,
                 alpha=0.7,
             )
+            # --- NIVEAU 1 : ANALYSE ---
+            editable_tokens = analyze_editability(
+                text=pred_text,
+                tokenizer=tokenizer,
+                editor_model=editor_model,
+                device=DEVICE,
+                threshold=0.75,
+            )
+
+            # LOG (debug seulement)
+            if len(editable_tokens) > 0 and b == 0 and False:
+                print("EDITABLE:", editable_tokens)
+
             # NIVEAU 0
             pred_text = graph_consistency_fix(pred_text, val_graphs[b])
             '''
