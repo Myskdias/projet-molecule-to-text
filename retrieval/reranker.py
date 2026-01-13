@@ -117,3 +117,58 @@ def rerank_topk_mbr_weighted(captions, graph_scores, beta=0.2):
         scores.append(final_score)
 
     return captions[max(range(k), key=lambda i: scores[i])]
+
+@torch.no_grad()
+def rerank_topk_hybrid_pruned(
+    captions,
+    graph_scores,
+    text_encoder,
+    alpha=0.7,
+    margin=0.02,
+    min_keep=1,
+):
+    """
+    captions: list[str]
+    graph_scores: list[float]
+    margin: exclusion threshold (relative to best graph score)
+    min_keep: minimum number of captions to keep
+    """
+
+    k = len(captions)
+    if k == 1:
+        return captions[0]
+
+    graph_scores_t = torch.tensor(graph_scores)
+
+    # --------------------------------------------------
+    # 1) Graph-based exclusion
+    # --------------------------------------------------
+    best_score = graph_scores_t.max().item()
+    keep_mask = graph_scores_t >= (best_score - margin)
+
+    keep_indices = keep_mask.nonzero(as_tuple=False).view(-1).tolist()
+
+    # Safety: keep at least top-1
+    if len(keep_indices) < min_keep:
+        keep_indices = [graph_scores_t.argmax().item()]
+
+    # Pruned candidates
+    captions_p = [captions[i] for i in keep_indices]
+    graph_scores_p = graph_scores_t[keep_indices]
+
+    # --------------------------------------------------
+    # 2) Standard hybrid reranking on pruned set
+    # --------------------------------------------------
+    text_emb = text_encoder(captions_p)
+    text_emb = F.normalize(text_emb, dim=-1)
+
+    centroid = text_emb.mean(dim=0, keepdim=True)
+    lexical_sim = (text_emb @ centroid.T).squeeze(1)
+
+    graph_sim = graph_scores_p.to(lexical_sim.device)
+
+    score = alpha * graph_sim + (1 - alpha) * lexical_sim
+    best_local = score.argmax().item()
+
+    return captions_p[best_local]
+
