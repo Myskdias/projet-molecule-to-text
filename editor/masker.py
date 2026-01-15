@@ -37,4 +37,6 @@ def load_vocab(vocab_path: str) -> set:
         vocab = pickle.load(f)
 
     assert isinstance(vocab, set), f"Expected vocab to be a set, got {type(vocab)}"
+    vocab.add("(")
+    vocab.add(")")
     return vocab
